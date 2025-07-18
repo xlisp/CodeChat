@@ -6,7 +6,7 @@
 # 4. conda create -n autogen python=3.11
 # 5. conda activate autogen
 # 6. which python
-# 7. python -m pip install pyautogen
+# 7. python -m pip install ag2
 # 7. ollama run mistral
 # 8. ollama run codellama
 # 9. # open new terminal
