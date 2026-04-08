@@ -1,1 +1,3 @@
 *.pyc
+.venv_data/
+*ay_local
