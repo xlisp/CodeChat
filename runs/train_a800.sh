@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# End-to-end CodeChat training on a single A800-SXM4-80GB, bf16.
+set -euo pipefail
+
+export CODECHAT_DTYPE=bfloat16
+export PYTHONUNBUFFERED=1
+
+RUN=${RUN:-codechat_d20}
+DEPTH=${DEPTH:-20}
+
+echo "==> [1/4] preparing pretraining shards"
+python -m scripts.prepare_pretrain --out-dir data/pretrain --max-shards 8
+
+echo "==> [2/4] pretraining (depth=$DEPTH)"
+python -m scripts.base_train \
+    --data-dir data/pretrain \
+    --depth "$DEPTH" \
+    --device-batch-size 16 \
+    --grad-accum 2 \
+    --max-steps 20000 \
+    --run "$RUN"
+
+echo "==> [3/4] preparing SFT data"
+python -m scripts.prepare_sft --out-dir data/sft
+
+echo "==> [4/4] SFT"
+python -m scripts.chat_sft \
+    --base-ckpt "checkpoints/${RUN}/latest.pt" \
+    --data-dir data/sft \
+    --device-batch-size 8 \
+    --grad-accum 4 \
+    --max-steps 3000 \
+    --run "${RUN}_sft"
+
+echo "==> done. try it:"
+echo "    python -m scripts.chat_cli --ckpt checkpoints/${RUN}_sft/latest.pt"

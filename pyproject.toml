@@ -1,0 +1,10 @@
+[project]
+name = "codechat"
+version = "0.1.0"
+description = "A minimal Python code Q&A LLM, nanochat-style, tuned for a single A800 80GB."
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+
+[tool.setuptools.packages.find]
+include = ["codechat*"]
