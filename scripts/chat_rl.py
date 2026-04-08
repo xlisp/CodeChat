@@ -9,6 +9,7 @@ checkpoint.
 Single-GPU, bf16, A800 80GB friendly.
 """
 import argparse
+import glob
 import os
 import time
 import copy
@@ -84,6 +85,16 @@ def main():
     ap.add_argument("--kl-coef", type=float, default=0.02)
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--tb-dir", default="runs/tb", help="tensorboard log root")
+    ap.add_argument(
+        "--save-every", type=int, default=50,
+        help="save step_{step:06d}.pt every N steps (in addition to latest.pt)",
+    )
+    ap.add_argument(
+        "--keep-every", type=int, default=50,
+        help="among saved step_*.pt files, persistently keep only multiples of this; "
+             "non-multiples get deleted at the next save. Set equal to --save-every "
+             "to keep every snapshot.",
+    )
     args = ap.parse_args()
 
     seed_all(1337)
@@ -182,9 +193,26 @@ def main():
                 f"(max {rewards.max().item():.2f}) | loss {total_loss:.4f} "
                 f"| lr {lr:.2e} | {time.time()-t0:.0f}s"
             )
-        if step % 200 == 0 or step == args.max_steps:
+        if step % args.save_every == 0 or step == args.max_steps:
             save_ckpt(ckpt_path, policy, optim, step, cfg)
-            print(f"  saved -> {ckpt_path}")
+            step_path = os.path.join(args.ckpt_dir, args.run, f"step_{step:06d}.pt")
+            save_ckpt(step_path, policy, optim, step, cfg)
+            # rotate older snapshots: keep only multiples of --keep-every
+            if args.keep_every > args.save_every:
+                for p in glob.glob(os.path.join(args.ckpt_dir, args.run, "step_*.pt")):
+                    base = os.path.basename(p)
+                    try:
+                        s = int(base[len("step_"):].split(".")[0])
+                    except Exception:
+                        continue
+                    if s == step:
+                        continue
+                    if s % args.keep_every != 0:
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+            print(f"  saved -> {ckpt_path} and {step_path}")
     writer.close()
 
 

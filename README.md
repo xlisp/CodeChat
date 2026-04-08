@@ -130,10 +130,12 @@ python -m scripts.chat_sft \
     --max-steps 3000
 
 # 5. 可执行奖励 RL（GRPO on MBPP）
+#    --save-every / --keep-every 控制中间 step 快照（用于事后挑最优 step，见下一节）
 python -m scripts.chat_rl \
     --sft-ckpt checkpoints/codechat_2b_sft/latest.pt \
     --max-steps 1000 \
-    --group-size 4
+    --group-size 4 \
+    --save-every 50 --keep-every 50
 
 # 6. 对话测试
 python -m scripts.chat_cli --ckpt checkpoints/codechat_2b_rl/latest.pt
@@ -146,6 +148,54 @@ python -m scripts.eval_swebench \
 ```
 
 > ⚠️ RL 阶段会在子进程里**真的执行模型生成的 Python 代码**以计算奖励。`codechat/execution.py` 只做了 timeout 保护，并不是真正的安全沙箱，请只在可信的训练机器上运行，不要把它暴露给不可信输入。
+
+## 选择最优 RL checkpoint
+
+GRPO 风格的 RL 里 train reward 会持续上升，但 eval 集上的 Pass@k 经常**先涨后跌** —— 典型的奖励 hacking / 熵塌缩。直接拿 `latest.pt` 部署很可能拿到次优模型，需要在中间 step 间横评，挑出真正的全局最优。参考 MathGPT A800 训练报告里的 RL 表，最优 step 出现在训练量的前 ~17%，剩下 80%+ 全部在平台期波动。
+
+`scripts/chat_rl.py` 默认每 50 步落一份 `step_{step:06d}.pt`（同时仍然覆盖 `latest.pt`）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--save-every` | `50` | 每 N 步同时写一份 `step_{step:06d}.pt` |
+| `--keep-every` | `50` | 旧 `step_*.pt` 只保留 step 是 keep-every 倍数的，其余在下次保存时删除。设为等于 `--save-every` 表示**每个快照都保留**；设为更大的值（如 `200`）可以在长训练里只留下稀疏归档以省盘 |
+
+跨 checkpoint 横评用 `scripts/eval_rl_ckpts.py`，输出和 MathGPT 报告同款的 step × Pass@k 表，并自动指出最优 step：
+
+```bash
+# 扫整个 RL run，给出每个 step 的 Pass@1 / Pass@4 / Pass@8 / Pass@16
+python -m scripts.eval_rl_ckpts \
+    --run-dir checkpoints/codechat_2b_rl \
+    --n-samples 16 --ks 1,4,8,16 --limit 100
+
+# 或只评单一 ckpt
+python -m scripts.eval_rl_ckpts \
+    --ckpt checkpoints/codechat_2b_rl/step_000120.pt
+```
+
+输出形如：
+
+```
+   step | Pass@1  | Pass@4  | Pass@8  | Pass@16 | secs
+--------+---------+---------+---------+---------+-----
+     50 |  3.00%  |  9.00%  | 14.00%  | 20.00%  |  ...
+    120 | 14.00%  | 24.00%  | 29.75%  | 38.00%  |  ...
+    180 | 11.00%  | 25.25%  | 30.25%  | 35.75%  |  ...
+    ...
+best by Pass@1: step 120 -> 14.00%
+```
+
+Pass@k 用 Codex paper 的无偏估计 `1 - C(n-c, k)/C(n, k)`，reward 直接复用 `codechat/execution.py`，和 RL 训练时打分完全一致。MBPP 默认走 `sanitized` 的 `test` split，和训练用的 `train` split 不重合。
+
+找到最优 step 后建议固化为 `best.pt`，让下游脚本 (`chat_cli.py` / `eval_swebench.py`) 默认用它而不是 `latest.pt`：
+
+```bash
+cp checkpoints/codechat_2b_rl/step_000120.pt checkpoints/codechat_2b_rl/best.pt
+python -m scripts.chat_cli --ckpt checkpoints/codechat_2b_rl/best.pt
+```
+
+> 💡 同时盯 **Pass@1 和 Pass@16**：如果 Pass@1 还在涨但 Pass@16 已经掉头，那是熵塌缩信号 —— 这种 step 在线上 `temperature>0` 的场景反而不稳。理想是两者同时达峰。
+> 💡 横评本身不便宜（每个 ckpt × 100 题 × 16 sample 都要起子进程跑 assert），先用 `--limit 50 --n-samples 8` 快速扫一遍找候选 step，再对前 3~5 个候选用完整 `--limit 0 --n-samples 16` 复测。
 
 ## 目录结构
 
@@ -168,7 +218,8 @@ CodeChat/
 │   ├── prepare_sft.py      # 下载并格式化 SFT 指令数据
 │   ├── base_train.py       # 预训练入口
 │   ├── chat_sft.py         # SFT 入口
-│   ├── chat_rl.py          # GRPO 风格 RL 入口（MBPP 可执行奖励）
+│   ├── chat_rl.py          # GRPO 风格 RL 入口（MBPP 可执行奖励，支持 step_*.pt 快照）
+│   ├── eval_rl_ckpts.py    # 跨 RL checkpoint 横评 Pass@k，挑出全局最优 step
 │   ├── eval_swebench.py    # SWE-bench Lite/Verified 补丁生成与评测入口
 │   └── chat_cli.py         # 命令行对话入口
 └── runs/
