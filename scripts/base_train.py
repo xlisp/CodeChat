@@ -5,7 +5,7 @@ import time
 import torch
 
 from codechat.common import DEVICE, COMPUTE_DTYPE, seed_all, get_num_params
-from codechat.gpt import GPT, GPTConfig
+from codechat.gpt import GPT, GPTConfig, make_config, PRESETS
 from codechat.dataloader import PretrainLoader
 from codechat.optim import build_optimizer, cosine_lr
 from codechat.checkpoint import save as save_ckpt
@@ -15,16 +15,16 @@ from codechat.tokenizer import VOCAB_SIZE
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default="data/pretrain")
-    ap.add_argument("--depth", type=int, default=20)
+    ap.add_argument("--preset", choices=list(PRESETS.keys()), default="2b")
     ap.add_argument("--block-size", type=int, default=2048)
-    ap.add_argument("--device-batch-size", type=int, default=16)
-    ap.add_argument("--grad-accum", type=int, default=2)
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--max-steps", type=int, default=20000)
-    ap.add_argument("--warmup", type=int, default=300)
-    ap.add_argument("--log-every", type=int, default=20)
+    ap.add_argument("--device-batch-size", type=int, default=2)
+    ap.add_argument("--grad-accum", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--max-steps", type=int, default=30000)
+    ap.add_argument("--warmup", type=int, default=500)
+    ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--save-every", type=int, default=2000)
-    ap.add_argument("--run", default="codechat_d20")
+    ap.add_argument("--run", default="codechat_2b")
     ap.add_argument("--ckpt-dir", default="checkpoints")
     args = ap.parse_args()
 
@@ -32,7 +32,7 @@ def main():
     assert DEVICE.type == "cuda", "A800 training requires CUDA"
     torch.set_float32_matmul_precision("high")
 
-    cfg = GPTConfig(vocab_size=VOCAB_SIZE, depth=args.depth, block_size=args.block_size)
+    cfg = make_config(args.preset, vocab_size=VOCAB_SIZE, block_size=args.block_size)
     model = GPT(cfg).to(DEVICE)
     # keep 2D weights in bf16 for compute; RMSNorm/embeddings already follow COMPUTE_DTYPE
     model = model.to(COMPUTE_DTYPE)

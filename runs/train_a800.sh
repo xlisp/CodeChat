@@ -5,19 +5,19 @@ set -euo pipefail
 export CODECHAT_DTYPE=bfloat16
 export PYTHONUNBUFFERED=1
 
-RUN=${RUN:-codechat_d20}
-DEPTH=${DEPTH:-20}
+RUN=${RUN:-codechat_2b}
+PRESET=${PRESET:-2b}
 
-echo "==> [1/4] preparing pretraining shards"
-python -m scripts.prepare_pretrain --out-dir data/pretrain --max-shards 8
+echo "==> [1/5] preparing pretraining shards"
+python -m scripts.prepare_pretrain --out-dir data/pretrain --max-shards 16
 
-echo "==> [2/4] pretraining (depth=$DEPTH)"
+echo "==> [2/5] pretraining (preset=$PRESET, ~2B params)"
 python -m scripts.base_train \
     --data-dir data/pretrain \
-    --depth "$DEPTH" \
-    --device-batch-size 16 \
-    --grad-accum 2 \
-    --max-steps 20000 \
+    --preset "$PRESET" \
+    --device-batch-size 2 \
+    --grad-accum 16 \
+    --max-steps 30000 \
     --run "$RUN"
 
 echo "==> [3/5] preparing SFT data"
@@ -27,8 +27,8 @@ echo "==> [4/5] SFT"
 python -m scripts.chat_sft \
     --base-ckpt "checkpoints/${RUN}/latest.pt" \
     --data-dir data/sft \
-    --device-batch-size 8 \
-    --grad-accum 4 \
+    --device-batch-size 1 \
+    --grad-accum 16 \
     --max-steps 3000 \
     --run "${RUN}_sft"
 

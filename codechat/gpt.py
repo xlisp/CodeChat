@@ -4,11 +4,12 @@ One dial of complexity: `depth`. Width/heads are derived from it so that the
 model stays roughly compute-optimal and behaves well on a single A800 80GB.
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as ckpt_fn
 
 from .common import COMPUTE_DTYPE
 
@@ -16,20 +17,29 @@ from .common import COMPUTE_DTYPE
 @dataclass
 class GPTConfig:
     vocab_size: int = 50257
-    depth: int = 20          # number of transformer blocks
-    block_size: int = 2048   # context length
+    depth: int = 32           # number of transformer blocks
+    n_embd: int = 2560        # hidden size
+    n_head: int = 20          # attention heads (head_dim = n_embd // n_head = 128)
+    block_size: int = 2048    # context length
     dropout: float = 0.0
+    grad_checkpoint: bool = True   # activation checkpointing to fit 2B on 80GB
 
-    @property
-    def n_head(self) -> int:
-        # heads scale with depth; keeps head_dim ~ 128
-        return max(8, self.depth // 2)
 
-    @property
-    def n_embd(self) -> int:
-        # width = 64 * n_head, so head_dim = 64 for small, 128 for larger
-        # nanochat rule-of-thumb: width = 64 * depth
-        return 64 * self.depth
+# Preset: ~2B parameters. Roughly 12*L*d^2 + vocab*d
+#   depth=32, n_embd=2560  ->  12*32*2560^2 ≈ 2.52B  (+ 128M tied embeddings)
+#   actual count including heads/norms ≈ 2.1–2.2B
+PRESETS = {
+    "d20":  dict(depth=20, n_embd=1280, n_head=10),   # ~400M
+    "d24":  dict(depth=24, n_embd=1792, n_head=14),   # ~900M
+    "2b":   dict(depth=32, n_embd=2560, n_head=20),   # ~2.1B
+    "3b":   dict(depth=32, n_embd=3072, n_head=24),   # ~3.0B (tight on 80GB)
+}
+
+
+def make_config(preset: str = "2b", **overrides) -> "GPTConfig":
+    p = dict(PRESETS[preset])
+    p.update(overrides)
+    return GPTConfig(**p)
 
 
 class CausalSelfAttention(nn.Module):
@@ -104,7 +114,10 @@ class GPT(nn.Module):
         pos = torch.arange(T, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(pos)[None, :, :]
         for block in self.blocks:
-            x = block(x)
+            if self.cfg.grad_checkpoint and self.training:
+                x = ckpt_fn(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         x = self.ln_f(x)
         logits = self.head(x)
         if targets is None:
