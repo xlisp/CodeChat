@@ -112,7 +112,7 @@ def main():
     ref.eval()
 
     from datasets import load_dataset
-    mbpp = load_dataset("mbpp", "sanitized", split="train")
+    mbpp = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
     print(f"loaded {len(mbpp)} MBPP problems")
 
     optim = build_optimizer(policy, lr=args.lr)

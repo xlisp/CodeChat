@@ -142,7 +142,7 @@ def main():
     assert max(ks) <= args.n_samples, f"max k={max(ks)} > n_samples={args.n_samples}"
 
     from datasets import load_dataset
-    ds = load_dataset("mbpp", "sanitized", split="test")
+    ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
     if args.limit > 0:
         ds = ds.select(range(min(args.limit, len(ds))))
     problems = list(ds)

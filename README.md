@@ -6,7 +6,7 @@ CodeChat 是一个参考 [nanochat](https://github.com/karpathy/nanochat) 实现
 
 对代码问答来说 RL 非常自然：代码是否正确**可以直接被执行器验证**，无需额外训练奖励模型，也无需人工偏好标注。CodeChat 的 RL 阶段采用 GRPO 风格：
 
-- 从 [`mbpp`](https://huggingface.co/datasets/mbpp) (sanitized) 中抽题，每题用当前策略采样 G 条回答
+- 从 [`mbpp`](https://huggingface.co/datasets/google-research-datasets/mbpp) (sanitized) 中抽题，每题用当前策略采样 G 条回答
 - 每条回答抽出代码，放到子进程中对 `test_list` 里的 `assert` 跑一遍，通过比例作为 reward（0~1）
 - 组内归一化得到 advantage，再用「PG loss + KL 到参考模型」更新策略
 - 参考模型就是 SFT checkpoint 本身，冻结不动，防止策略漂走
@@ -50,7 +50,7 @@ pip install -r requirements.txt
 | 预训练 | [`codeparrot/github-code-clean`](https://huggingface.co/datasets/codeparrot/github-code-clean) (Python 子集) | 清洗后的 GitHub Python 源码 |
 | SFT | [`iamtarun/python_code_instructions_18k_alpaca`](https://huggingface.co/datasets/iamtarun/python_code_instructions_18k_alpaca) | 1.8w 条 Python 指令问答对 |
 | SFT 混合 | [`sahil2801/CodeAlpaca-20k`](https://huggingface.co/datasets/sahil2801/CodeAlpaca-20k) | 2w 条通用代码指令 |
-| RL | [`mbpp`](https://huggingface.co/datasets/mbpp) (sanitized) | 带 `test_list` 的 Python 题目，可执行验证 |
+| RL | [`mbpp`](https://huggingface.co/datasets/google-research-datasets/mbpp) (sanitized) | 带 `test_list` 的 Python 题目，可执行验证 |
 
 分词器直接复用 GPT-2 BPE（`tiktoken` 的 `gpt2` 编码），在代码场景下压缩率足够，无需另行训练。
 
