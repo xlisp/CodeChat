@@ -10,6 +10,7 @@ VENV_DIR="${REPO_ROOT}/.venv_data"
 OUT_DIR="${OUT_DIR:-data/pretrain}"
 MAX_SHARDS="${MAX_SHARDS:-16}"
 
+# can not use proxy for it
 if [ ! -d "${VENV_DIR}" ]; then
     echo "==> creating venv at ${VENV_DIR}"
     python3 -m venv "${VENV_DIR}"
@@ -25,6 +26,7 @@ if [ ! -d "${VENV_DIR}" ]; then
         requests
 fi
 
+# use proxy
 echo "==> running prepare_pretrain.py inside ${VENV_DIR}"
 cd "${REPO_ROOT}"
 PYTHONPATH="${REPO_ROOT}" "${VENV_DIR}/bin/python" -m scripts.prepare_pretrain \
