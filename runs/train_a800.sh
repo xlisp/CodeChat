@@ -9,7 +9,8 @@ RUN=${RUN:-codechat_2b}
 PRESET=${PRESET:-2b}
 
 echo "==> [1/5] preparing pretraining shards"
-OUT_DIR=data/pretrain MAX_SHARDS=16 bash runs/prepare_pretrain_venv.sh
+# single execute
+### OUT_DIR=data/pretrain MAX_SHARDS=16 bash runs/prepare_pretrain_venv.sh
 
 echo "==> [2/5] pretraining (preset=$PRESET, ~2B params)"
 python -m scripts.base_train \
