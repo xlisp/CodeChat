@@ -8,7 +8,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${REPO_ROOT}/.venv_data"
 OUT_DIR="${OUT_DIR:-data/pretrain}"
-MAX_SHARDS="${MAX_SHARDS:-16}"
+MAX_SHARDS="${MAX_SHARDS:-32}"
 
 # can not use proxy for it
 if [ ! -d "${VENV_DIR}" ]; then
