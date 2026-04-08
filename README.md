@@ -1,6 +1,17 @@
 # CodeChat
 
-CodeChat 是一个参考 [nanochat](https://github.com/karpathy/nanochat) 实现的极简 Python 代码问答模型训练框架。目标是在**单卡 NVIDIA A800-SXM4-80GB** 上，从公开的 Python 代码/指令数据集出发，端到端完成「预训练 → 指令微调（SFT）→ 对话推理」的完整流程，产出一个可以回答 Python 代码问题的小模型。
+CodeChat 是一个参考 [nanochat](https://github.com/karpathy/nanochat) 实现的极简 Python 代码问答模型训练框架。目标是在**单卡 NVIDIA A800-SXM4-80GB** 上，从公开的 Python 代码/指令数据集出发，端到端完成「预训练 → 指令微调（SFT）→ 可执行奖励强化学习（RL）→ 对话推理」的完整流程，产出一个可以回答 Python 代码问题的小模型。
+
+## 为什么要有 RL 阶段？
+
+对代码问答来说 RL 非常自然：代码是否正确**可以直接被执行器验证**，无需额外训练奖励模型，也无需人工偏好标注。CodeChat 的 RL 阶段采用 GRPO 风格：
+
+- 从 [`mbpp`](https://huggingface.co/datasets/mbpp) (sanitized) 中抽题，每题用当前策略采样 G 条回答
+- 每条回答抽出代码，放到子进程中对 `test_list` 里的 `assert` 跑一遍，通过比例作为 reward（0~1）
+- 组内归一化得到 advantage，再用「PG loss + KL 到参考模型」更新策略
+- 参考模型就是 SFT checkpoint 本身，冻结不动，防止策略漂走
+
+这个阶段可以显著提升模型在实际 Python 题目上的一次通过率，尤其是修好 SFT 后常见的「语法对但跑不通」问题。
 
 ## 特点
 
@@ -39,6 +50,7 @@ pip install -r requirements.txt
 | 预训练 | [`codeparrot/github-code-clean`](https://huggingface.co/datasets/codeparrot/github-code-clean) (Python 子集) | 清洗后的 GitHub Python 源码 |
 | SFT | [`iamtarun/python_code_instructions_18k_alpaca`](https://huggingface.co/datasets/iamtarun/python_code_instructions_18k_alpaca) | 1.8w 条 Python 指令问答对 |
 | SFT 混合 | [`sahil2801/CodeAlpaca-20k`](https://huggingface.co/datasets/sahil2801/CodeAlpaca-20k) | 2w 条通用代码指令 |
+| RL | [`mbpp`](https://huggingface.co/datasets/mbpp) (sanitized) | 带 `test_list` 的 Python 题目，可执行验证 |
 
 分词器直接复用 GPT-2 BPE（`tiktoken` 的 `gpt2` 编码），在代码场景下压缩率足够，无需另行训练。
 
@@ -54,7 +66,8 @@ bash runs/train_a800.sh
 2. `scripts/base_train.py`          单卡预训练一个 `depth=20` 的 GPT（约 560M 参数，bf16 下峰值显存 ~55GB）
 3. `scripts/prepare_sft.py`         拉取并格式化 SFT 指令数据
 4. `scripts/chat_sft.py`            在预训练 checkpoint 上做指令微调
-5. `scripts/chat_cli.py`            启动命令行对话，测试你的 CodeChat
+5. `scripts/chat_rl.py`             在 SFT checkpoint 上做可执行奖励 RL（GRPO on MBPP）
+6. `scripts/chat_cli.py`            启动命令行对话，测试你的 CodeChat
 
 ## 模型规格（默认 `--depth=20`）
 
@@ -94,9 +107,17 @@ python -m scripts.chat_sft \
     --data-dir data/sft \
     --max-steps 3000
 
-# 5. 对话测试
-python -m scripts.chat_cli --ckpt checkpoints/codechat_d20_sft/latest.pt
+# 5. 可执行奖励 RL（GRPO on MBPP）
+python -m scripts.chat_rl \
+    --sft-ckpt checkpoints/codechat_d20_sft/latest.pt \
+    --max-steps 1000 \
+    --group-size 4
+
+# 6. 对话测试
+python -m scripts.chat_cli --ckpt checkpoints/codechat_d20_rl/latest.pt
 ```
+
+> ⚠️ RL 阶段会在子进程里**真的执行模型生成的 Python 代码**以计算奖励。`codechat/execution.py` 只做了 timeout 保护，并不是真正的安全沙箱，请只在可信的训练机器上运行，不要把它暴露给不可信输入。
 
 ## 目录结构
 
@@ -111,13 +132,15 @@ CodeChat/
 │   ├── gpt.py              # GPT Transformer 模型定义
 │   ├── tokenizer.py        # tiktoken GPT-2 BPE 包装
 │   ├── dataloader.py       # 分布式/单卡数据加载器
-│   ├── optim.py            # AdamW + Muon 优化器
+│   ├── optim.py            # AdamW + cosine LR
+│   ├── execution.py        # RL 奖励：子进程执行代码 + assert 判分
 │   └── checkpoint.py       # 保存/加载 checkpoint
 ├── scripts/
 │   ├── prepare_pretrain.py # 下载并分片 Python 预训练语料
 │   ├── prepare_sft.py      # 下载并格式化 SFT 指令数据
 │   ├── base_train.py       # 预训练入口
 │   ├── chat_sft.py         # SFT 入口
+│   ├── chat_rl.py          # GRPO 风格 RL 入口（MBPP 可执行奖励）
 │   └── chat_cli.py         # 命令行对话入口
 └── runs/
     └── train_a800.sh       # 单卡 A800 端到端一键脚本

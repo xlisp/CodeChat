@@ -20,10 +20,10 @@ python -m scripts.base_train \
     --max-steps 20000 \
     --run "$RUN"
 
-echo "==> [3/4] preparing SFT data"
+echo "==> [3/5] preparing SFT data"
 python -m scripts.prepare_sft --out-dir data/sft
 
-echo "==> [4/4] SFT"
+echo "==> [4/5] SFT"
 python -m scripts.chat_sft \
     --base-ckpt "checkpoints/${RUN}/latest.pt" \
     --data-dir data/sft \
@@ -32,5 +32,12 @@ python -m scripts.chat_sft \
     --max-steps 3000 \
     --run "${RUN}_sft"
 
+echo "==> [5/5] RL (GRPO on MBPP, executable reward)"
+python -m scripts.chat_rl \
+    --sft-ckpt "checkpoints/${RUN}_sft/latest.pt" \
+    --max-steps 1000 \
+    --group-size 4 \
+    --run "${RUN}_rl"
+
 echo "==> done. try it:"
-echo "    python -m scripts.chat_cli --ckpt checkpoints/${RUN}_sft/latest.pt"
+echo "    python -m scripts.chat_cli --ckpt checkpoints/${RUN}_rl/latest.pt"
