@@ -14,6 +14,7 @@ import time
 import copy
 import torch
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 from codechat.common import DEVICE, COMPUTE_DTYPE, seed_all
 from codechat.gpt import GPT, GPTConfig
@@ -82,6 +83,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--kl-coef", type=float, default=0.02)
     ap.add_argument("--clip", type=float, default=0.2)
+    ap.add_argument("--tb-dir", default="runs/tb", help="tensorboard log root")
     args = ap.parse_args()
 
     seed_all(1337)
@@ -104,6 +106,9 @@ def main():
 
     optim = build_optimizer(policy, lr=args.lr)
     ckpt_path = os.path.join(args.ckpt_dir, args.run, "latest.pt")
+    tb_path = os.path.join(args.tb_dir, args.run)
+    writer = SummaryWriter(log_dir=tb_path)
+    print(f"tensorboard -> {tb_path}")
     t0 = time.time()
 
     for step in range(1, args.max_steps + 1):
@@ -140,6 +145,8 @@ def main():
         policy.train()
         optim.zero_grad(set_to_none=True)
         total_loss = 0.0
+        total_pg = 0.0
+        total_kl = 0.0
         for (full_ids, _), a in zip(rollouts, adv):
             logp_pol = forward_logps(policy, full_ids, prompt_len)
             with torch.no_grad():
@@ -151,8 +158,23 @@ def main():
             loss = pg + args.kl_coef * kl
             (loss / args.group_size).backward()
             total_loss += loss.item() / args.group_size
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), args.clip * 5)
+            total_pg += pg.item() / args.group_size
+            total_kl += kl.item() / args.group_size
+        grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.clip * 5)
         optim.step()
+
+        writer.add_scalar("rl/reward_mean", rewards.mean().item(), step)
+        writer.add_scalar("rl/reward_max", rewards.max().item(), step)
+        writer.add_scalar("rl/reward_min", rewards.min().item(), step)
+        writer.add_scalar("rl/reward_std", rewards.std().item(), step)
+        writer.add_scalar("rl/advantage_abs_mean", adv.abs().mean().item(), step)
+        writer.add_scalar("rl/loss_total", total_loss, step)
+        writer.add_scalar("rl/loss_pg", total_pg, step)
+        writer.add_scalar("rl/kl", total_kl, step)
+        writer.add_scalar("rl/lr", lr, step)
+        writer.add_scalar("rl/grad_norm", float(grad_norm), step)
+        writer.add_scalar("rl/prompt_len", prompt_len, step)
+        writer.add_scalar("rl/elapsed_s", time.time() - t0, step)
 
         if step % 5 == 0:
             print(
@@ -163,6 +185,7 @@ def main():
         if step % 200 == 0 or step == args.max_steps:
             save_ckpt(ckpt_path, policy, optim, step, cfg)
             print(f"  saved -> {ckpt_path}")
+    writer.close()
 
 
 if __name__ == "__main__":

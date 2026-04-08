@@ -3,6 +3,7 @@ import argparse
 import os
 import time
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from codechat.common import DEVICE, COMPUTE_DTYPE, seed_all, get_num_params
 from codechat.gpt import GPT, GPTConfig, make_config, PRESETS
@@ -26,6 +27,7 @@ def main():
     ap.add_argument("--save-every", type=int, default=2000)
     ap.add_argument("--run", default="codechat_2b")
     ap.add_argument("--ckpt-dir", default="checkpoints")
+    ap.add_argument("--tb-dir", default="runs/tb", help="tensorboard log root")
     args = ap.parse_args()
 
     seed_all(1337)
@@ -42,6 +44,9 @@ def main():
     optim = build_optimizer(model, lr=args.lr)
 
     ckpt_path = os.path.join(args.ckpt_dir, args.run, "latest.pt")
+    tb_path = os.path.join(args.tb_dir, args.run)
+    writer = SummaryWriter(log_dir=tb_path)
+    print(f"tensorboard -> {tb_path}")
     t0 = time.time()
     model.train()
     for step in range(1, args.max_steps + 1):
@@ -56,16 +61,24 @@ def main():
             _, loss = model(x, y)
             (loss / args.grad_accum).backward()
             loss_accum += loss.item() / args.grad_accum
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optim.step()
 
+        dt = time.time() - t0
+        tok = step * args.grad_accum * args.device_batch_size * args.block_size
+        ktok_s = tok / dt / 1e3
+        writer.add_scalar("train/loss", loss_accum, step)
+        writer.add_scalar("train/lr", lr, step)
+        writer.add_scalar("train/grad_norm", float(grad_norm), step)
+        writer.add_scalar("perf/ktok_per_s", ktok_s, step)
+        writer.add_scalar("perf/tokens_seen", tok, step)
+
         if step % args.log_every == 0:
-            dt = time.time() - t0
-            tok = step * args.grad_accum * args.device_batch_size * args.block_size
-            print(f"step {step:6d} | loss {loss_accum:.4f} | lr {lr:.2e} | {tok/dt/1e3:.1f} Ktok/s")
+            print(f"step {step:6d} | loss {loss_accum:.4f} | lr {lr:.2e} | {ktok_s:.1f} Ktok/s")
         if step % args.save_every == 0 or step == args.max_steps:
             save_ckpt(ckpt_path, model, optim, step, cfg)
             print(f"  saved -> {ckpt_path}")
+    writer.close()
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import argparse
 import os
 import time
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from codechat.common import DEVICE, COMPUTE_DTYPE, seed_all
 from codechat.gpt import GPT, GPTConfig
@@ -22,6 +23,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=100)
     ap.add_argument("--run", default="codechat_d20_sft")
     ap.add_argument("--ckpt-dir", default="checkpoints")
+    ap.add_argument("--tb-dir", default="runs/tb", help="tensorboard log root")
     args = ap.parse_args()
 
     seed_all(1337)
@@ -39,6 +41,9 @@ def main():
     optim = build_optimizer(model, lr=args.lr)
 
     ckpt_path = os.path.join(args.ckpt_dir, args.run, "latest.pt")
+    tb_path = os.path.join(args.tb_dir, args.run)
+    writer = SummaryWriter(log_dir=tb_path)
+    print(f"tensorboard -> {tb_path}")
     t0 = time.time()
     model.train()
     for step in range(1, args.max_steps + 1):
@@ -52,14 +57,20 @@ def main():
             _, loss = model(x, y)
             (loss / args.grad_accum).backward()
             loss_accum += loss.item() / args.grad_accum
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optim.step()
+
+        writer.add_scalar("sft/loss", loss_accum, step)
+        writer.add_scalar("sft/lr", lr, step)
+        writer.add_scalar("sft/grad_norm", float(grad_norm), step)
+        writer.add_scalar("sft/elapsed_s", time.time() - t0, step)
 
         if step % 20 == 0:
             print(f"sft step {step:5d} | loss {loss_accum:.4f} | lr {lr:.2e} | {time.time()-t0:.0f}s")
         if step % 500 == 0 or step == args.max_steps:
             save_ckpt(ckpt_path, model, optim, step, cfg)
             print(f"  saved -> {ckpt_path}")
+    writer.close()
 
 
 if __name__ == "__main__":
