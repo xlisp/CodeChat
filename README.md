@@ -137,6 +137,12 @@ python -m scripts.chat_rl \
 
 # 6. 对话测试
 python -m scripts.chat_cli --ckpt checkpoints/codechat_2b_rl/latest.pt
+
+# 7. SWE-bench Lite 评测（生成补丁；打分需另行用官方 Docker harness）
+python -m scripts.eval_swebench \
+    --ckpt checkpoints/codechat_2b_rl/latest.pt \
+    --split lite \
+    --out predictions/codechat_2b_rl.jsonl
 ```
 
 > ⚠️ RL 阶段会在子进程里**真的执行模型生成的 Python 代码**以计算奖励。`codechat/execution.py` 只做了 timeout 保护，并不是真正的安全沙箱，请只在可信的训练机器上运行，不要把它暴露给不可信输入。
@@ -163,10 +169,31 @@ CodeChat/
 │   ├── base_train.py       # 预训练入口
 │   ├── chat_sft.py         # SFT 入口
 │   ├── chat_rl.py          # GRPO 风格 RL 入口（MBPP 可执行奖励）
+│   ├── eval_swebench.py    # SWE-bench Lite/Verified 补丁生成与评测入口
 │   └── chat_cli.py         # 命令行对话入口
 └── runs/
     └── train_a800.sh       # 单卡 A800 端到端一键脚本
 ```
+
+## 评测
+
+训练完成后在 SWE-bench 上测分：
+
+```bash
+# Step 1: 模型生成补丁（只用 GPU，不需要 Docker）
+python -m scripts.eval_swebench \
+    --ckpt checkpoints/codechat_2b_rl/latest.pt \
+    --split lite --out predictions/codechat_2b_rl.jsonl
+
+# Step 2: 在任意有 Docker 的机器上跑官方 harness 打分
+pip install swebench
+python -m swebench.harness.run_evaluation \
+    --dataset_name princeton-nlp/SWE-bench_Lite \
+    --predictions_path predictions/codechat_2b_rl.jsonl \
+    --max_workers 4 --run_id codechat_2b_rl
+```
+
+2B 小模型在 SWE-bench Lite 上的预期分数非常低（约 0–1%），详细的动机、局限与提升方向见 [`docs/swebench_eval.md`](docs/swebench_eval.md)。另一个相关文档是 RL 算法选型：[`docs/rl_algorithms.md`](docs/rl_algorithms.md)。
 
 ## 致谢
 
