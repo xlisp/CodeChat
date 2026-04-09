@@ -9,7 +9,7 @@ RUN=${RUN:-codechat_2b}
 PRESET=${PRESET:-2b}
 
 echo "==> [1/5] preparing pretraining shards"
-# single execute
+# single execute: DONE:  256M    data/pretrain/shard_0000.bin ... data/pretrain/shard_0031.bin => all is 8.1G
 ### OUT_DIR=data/pretrain MAX_SHARDS=16 bash runs/prepare_pretrain_venv.sh
 
 echo "==> [2/5] pretraining (preset=$PRESET, ~2B params)"
