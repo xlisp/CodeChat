@@ -14,12 +14,17 @@
 # 关于 checkpoint:
 #   - 2B 的 checkpoints/codechat_2b/latest.pt 维度和 8B 不兼容，无法直接续训
 #   - 8B 走独立 run 名 codechat_8b，从零开始预训练
-#   - 如果想从 2B 蒸馏或 warm-start 另说 (--resume 只接受同 shape)
+#
+# 关于 Python 环境 (.venv_train):
+#   - 宿主 python 3.12.3 + torch 2.10.0+cu130 是系统装好的，root 无法 pip 安装
+#   - 脚本首次运行会在 .venv_train/ 建一个 venv，--system-site-packages 继承
+#     系统的 torch / CUDA，再 pip 安装缺的 tensorboard / tiktoken / datasets / ...
+#   - torchrun 走 `python -m torch.distributed.run`，避免 PATH 里找不到 torchrun
+#     的入口脚本
 #
 # 前置条件:
 #   - 8x A800 80GB (NVLink/NVSwitch 最佳)
-#   - torch>=2.1 (FSDP use_orig_params=True 需要)
-#   - CUDA 12.x, NCCL 可用
+#   - 系统预装 torch (>=2.1) 且能 import
 #   - 预训练数据已准备好: data/pretrain/shard_*.bin
 # =============================================================================
 set -euo pipefail
@@ -42,6 +47,46 @@ MASTER_PORT=${MASTER_PORT:-29500}
 # 跳过已完成阶段: SKIP_TO=4 会直接从 stage 4 开始
 SKIP_TO=${SKIP_TO:-1}
 
+# ---------------------------------------------------------------------------
+# Bootstrap a training venv that inherits the system-installed torch.
+# ---------------------------------------------------------------------------
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="${REPO_ROOT}/.venv_train"
+SYS_PYTHON=${SYS_PYTHON:-python3}
+
+if [ ! -d "${VENV_DIR}" ]; then
+    echo "==> [env] creating training venv at ${VENV_DIR}"
+    echo "         (--system-site-packages so we reuse system torch/CUDA)"
+    "${SYS_PYTHON}" -m venv --system-site-packages "${VENV_DIR}"
+    "${VENV_DIR}/bin/pip" install --upgrade pip wheel
+    # 只装训练/数据需要但系统里没有的轻量包；torch 来自 system site-packages
+    "${VENV_DIR}/bin/pip" install \
+        "tensorboard>=2.16.0" \
+        "tiktoken>=0.7.0" \
+        "numpy>=1.26" \
+        "tqdm>=4.66.0" \
+        "datasets<4.0" \
+        "huggingface_hub<0.24" \
+        "fsspec<=2024.5.0" \
+        "pyarrow" \
+        "requests" \
+        "httpx[socks]"
+fi
+
+PY="${VENV_DIR}/bin/python"
+# Sanity check: venv 里应该能直接 import torch (来自 system site-packages)
+"${PY}" - <<'PYEOF'
+import torch, sys
+print(f"[env] python = {sys.executable}")
+print(f"[env] torch  = {torch.__version__}  cuda={torch.version.cuda}  n_gpu={torch.cuda.device_count()}")
+PYEOF
+
+# 用 `python -m torch.distributed.run` 代替 `torchrun`，省得依赖 $PATH 里的 entry script
+TORCHRUN_CMD=("${PY}" -m torch.distributed.run)
+
+# 让 import codechat.* 能找到仓库根目录（venv 里没有以 editable 方式装本项目）
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+
 # ===========================================================================
 # Stage 1: Pretrain data preparation
 # ===========================================================================
@@ -58,13 +103,10 @@ fi
 #   - device_batch_size=1, grad_accum=8, world_size=8
 #   - global batch = 1 * 8 * 8 * 2048 = 131k tokens / step
 #   - 30k steps ≈ 3.9B tokens seen (与 2B run 相当量级)
-#
-# 如果显存告急，先降 device-batch-size 到 1 并加大 grad-accum；
-# 若还不够，可以调整 block_size=1024 (但数据也得改)
 # ===========================================================================
 if [ "$SKIP_TO" -le 2 ]; then
 echo "==> [2/5] pretraining 8B (preset=$PRESET, FSDP x$NPROC)"
-torchrun \
+"${TORCHRUN_CMD[@]}" \
     --standalone \
     --nproc_per_node="$NPROC" \
     --master_addr="$MASTER_ADDR" \
@@ -87,20 +129,18 @@ fi
 # ===========================================================================
 if [ "$SKIP_TO" -le 3 ]; then
 echo "==> [3/5] preparing SFT data"
-python -m scripts.prepare_sft --out-dir data/sft
+"${PY}" -m scripts.prepare_sft --out-dir data/sft
 fi
 
 # ===========================================================================
 # Stage 4: SFT — 8B also needs FSDP (optimizer states blow single card otherwise)
 #
-# 注意: scripts.chat_sft 尚未加 FSDP 支持。这里留两种选择：
-#   (a) 若已给 chat_sft.py 打上和 base_train 一样的 FSDP 补丁，直接 torchrun 即可
-#   (b) 若暂未实现，可以用更小的 lr + 多卡 DDP 跑短 SFT (不推荐 8B 单卡)
-# 当前脚本按 (a) 写，后续在 chat_sft.py 里补 setup_distributed+wrap_fsdp 即可复用
+# 注意: scripts.chat_sft 当前还没加 FSDP 支持。若未打 FSDP 补丁，这一步
+# 在 8B 会 OOM。可先用 d24 预设过 pipeline，或等 chat_sft.py 跟进分布式改动。
 # ===========================================================================
 if [ "$SKIP_TO" -le 4 ]; then
 echo "==> [4/5] SFT 8B (FSDP x$NPROC)"
-torchrun \
+"${TORCHRUN_CMD[@]}" \
     --standalone \
     --nproc_per_node="$NPROC" \
     --master_addr="$MASTER_ADDR" \
@@ -116,13 +156,10 @@ fi
 
 # ===========================================================================
 # Stage 5: RL (GRPO on MBPP, executable reward)
-#
-# RL 通常一张卡就能跑 (rollout 采样为主)，8B 模型除外，仍建议 FSDP。
-# 如果 chat_rl.py 暂未加 FSDP，可先缩小到 d24 验证 pipeline。
 # ===========================================================================
 if [ "$SKIP_TO" -le 5 ]; then
 echo "==> [5/5] RL — GRPO on MBPP"
-python -m scripts.chat_rl \
+"${PY}" -m scripts.chat_rl \
     --sft-ckpt "checkpoints/${RUN}_sft/latest.pt" \
     --max-steps 1000 \
     --group-size 4 \
@@ -143,10 +180,10 @@ echo "  SFT:      checkpoints/${RUN}_sft/latest.pt"
 echo "  RL:       checkpoints/${RUN}_rl/latest.pt"
 echo ""
 echo "TensorBoard:"
-echo "  tensorboard --logdir runs/tb"
+echo "  ${VENV_DIR}/bin/tensorboard --logdir runs/tb"
 echo ""
 echo "Chat:"
-echo "  python -m scripts.chat_cli --ckpt checkpoints/${RUN}_rl/latest.pt"
+echo "  ${PY} -m scripts.chat_cli --ckpt checkpoints/${RUN}_rl/latest.pt"
 echo ""
 echo "Skip to a specific stage on re-run:"
 echo "  SKIP_TO=4 bash runs/train_a800_x8.sh"

@@ -1,4 +1,8 @@
-torch==2.7.1
+# torch is intentionally unpinned: on single A800 we built against 2.7.1+cu128,
+# but the 8x A800 host ships with 2.10.0+cu130 preinstalled system-wide. The
+# 8-GPU launcher creates a venv with --system-site-packages to reuse whatever
+# torch is on the system; single-GPU setups can pip install any torch>=2.1.
+torch>=2.1
 numpy>=1.26
 tiktoken>=0.7.0
 datasets>=2.19.0

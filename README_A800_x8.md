@@ -8,10 +8,13 @@
 
 ```bash
 # 一键 (data + 8B pretrain + SFT + RL)
+# 首次运行会自动创建 .venv_train（复用系统 torch），再装 tensorboard 等缺的包
 bash runs/train_a800_x8.sh
 
-# 或者只跑预训练
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
+# 或者只跑预训练 (venv 已建好后)
+./.venv_train/bin/python -m torch.distributed.run \
+    --standalone --nproc_per_node=8 \
+    -m scripts.base_train \
     --data-dir data/pretrain \
     --preset 8b \
     --device-batch-size 1 \
@@ -22,6 +25,42 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
 ```
 
 > ⚠️ **一定用 `--run-name` 而不是 `--run`**：`torchrun` 的 argparse 有个 `--run-path` 选项，看到 `--run` 会判为 "ambiguous option" 然后直接报错（在还没把参数转发给训练脚本之前就挂了）。`--run-name` 不是它任何选项的前缀，才会被透传。base_train/chat_sft/chat_rl 里同时兼容 `--run` (单卡老脚本) 和 `--run-name` (torchrun 场景)。
+
+## Python 环境 (`.venv_train`)
+
+这台 8x A800 的宿主上 root 不能往系统 site-packages 里安装东西，因此不能直接 `pip install -r requirements.txt`。`runs/train_a800_x8.sh` 首次运行时会自动做这几件事：
+
+1. **建一个 venv**：`python3 -m venv --system-site-packages .venv_train`
+   - `--system-site-packages` 让 venv 继承系统安装的 torch / CUDA / nvidia-* wheel，**不重装 torch** (重装 2.10.0+cu130 会非常慢且可能装坏)。
+2. **pip 装训练缺的包到 venv 里**：tensorboard、tiktoken、numpy、tqdm、datasets(<4.0)、huggingface_hub(<0.24)、fsspec、pyarrow、requests、httpx[socks]。这些安装在 `.venv_train/lib/python3.12/site-packages/`，**不污染系统**。
+3. **sanity check**：venv 的 python 能 import 到系统 torch，并打印 `torch.__version__ / cuda / n_gpu`。
+4. **用 `python -m torch.distributed.run` 代替 `torchrun`**：venv 的 `bin/` 里没有 torchrun 的入口脚本（因为 torch 来自系统 site-packages），所以直接用模块形式启动，效果完全等价。
+5. **设置 `PYTHONPATH=$REPO_ROOT`**：项目没 `pip install -e .`，靠 PYTHONPATH 让 `import codechat.*` 能找到仓库目录。
+
+宿主环境参考：
+
+| 项目 | 版本 |
+|---|---|
+| OS | Ubuntu (/mnt/openclaw/CodeChat) |
+| Python | 3.12.3 |
+| torch | 2.10.0+cu130 (系统预装) |
+| CUDA | 13.0 |
+| GPU | 8x A800-SXM4-80GB |
+
+如果宿主 python 不叫 `python3`，用 `SYS_PYTHON=/path/to/python bash runs/train_a800_x8.sh` 覆盖。
+
+**常用操作**：
+
+```bash
+# 看 venv 里装了什么
+./.venv_train/bin/pip list
+
+# 手动进入 venv (交互 debug 用)
+source .venv_train/bin/activate
+
+# 想重建 venv: 直接删
+rm -rf .venv_train && bash runs/train_a800_x8.sh
+```
 
 - 预设 `8b`:  `depth=40, n_embd=4096, n_head=32`, **~8.3B 参数**
 - 分片策略: **FSDP `FULL_SHARD`** (params + grads + AdamW 状态全部按 rank 切 8 份)
