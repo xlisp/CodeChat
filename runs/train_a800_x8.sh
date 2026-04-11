@@ -49,36 +49,76 @@ SKIP_TO=${SKIP_TO:-1}
 
 # ---------------------------------------------------------------------------
 # Bootstrap a training venv that inherits the system-installed torch.
+#
+# 这套宿主 (Debian/Ubuntu 风格) 有两个坑:
+#   1) 系统装的 torch 往往在 /usr/local/lib/python3.12/dist-packages，
+#      而 venv --system-site-packages 未必把 dist-packages 带进 sys.path
+#   2) `python` 和 `python3` 可能是不同二进制，只有一个装了 torch
+# 解决:
+#   - 先探测哪个 python 能 import torch，用它建 venv
+#   - 建完后再 sanity check，如果 venv 还是 import 不到 torch，就把宿主 torch
+#     的 site-packages 目录写进 venv 的 .pth 文件里强行接上
 # ---------------------------------------------------------------------------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${REPO_ROOT}/.venv_train"
-SYS_PYTHON=${SYS_PYTHON:-python3}
 
+# 1) 找一个能 import torch 的 system python
+if [ -z "${SYS_PYTHON:-}" ]; then
+    for cand in python python3 python3.12 python3.11 python3.10; do
+        if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import torch" >/dev/null 2>&1; then
+            SYS_PYTHON="$(command -v "$cand")"
+            break
+        fi
+    done
+fi
+if [ -z "${SYS_PYTHON:-}" ]; then
+    echo "ERROR: 找不到装了 torch 的 system python。请手动 SYS_PYTHON=/path/to/python 重试。" >&2
+    exit 1
+fi
+echo "==> [env] system python = ${SYS_PYTHON}"
+"${SYS_PYTHON}" -c "import torch, sys; print(f'         -> python {sys.version.split()[0]}, torch {torch.__version__}, cuda {torch.version.cuda}')"
+
+# 2) 记下宿主 torch 所在 site-packages，供后面 .pth 兜底
+SYS_TORCH_SITE="$("${SYS_PYTHON}" -c 'import torch, os; print(os.path.dirname(os.path.dirname(torch.__file__)))')"
+echo "         torch site = ${SYS_TORCH_SITE}"
+
+# 3) 建 venv
 if [ ! -d "${VENV_DIR}" ]; then
     echo "==> [env] creating training venv at ${VENV_DIR}"
     echo "         (--system-site-packages so we reuse system torch/CUDA)"
     "${SYS_PYTHON}" -m venv --system-site-packages "${VENV_DIR}"
     "${VENV_DIR}/bin/pip" install --upgrade pip wheel
-    # 只装训练/数据需要但系统里没有的轻量包；torch 来自 system site-packages
-    "${VENV_DIR}/bin/pip" install \
-        "tensorboard>=2.16.0" \
-        "tiktoken>=0.7.0" \
-        "numpy>=1.26" \
-        "tqdm>=4.66.0" \
-        "datasets<4.0" \
-        "huggingface_hub<0.24" \
-        "fsspec<=2024.5.0" \
-        "pyarrow" \
-        "requests" \
-        "httpx[socks]"
 fi
 
 PY="${VENV_DIR}/bin/python"
-# Sanity check: venv 里应该能直接 import torch (来自 system site-packages)
+
+# 4) 兜底：如果 venv 还是找不到 torch，把宿主 torch site-packages 写进 .pth
+if ! "${PY}" -c "import torch" >/dev/null 2>&1; then
+    echo "==> [env] venv 无法 import torch，追加 .pth 指向宿主 torch site-packages"
+    VENV_SITE="$("${PY}" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+    echo "${SYS_TORCH_SITE}" > "${VENV_SITE}/system_torch.pth"
+fi
+
+# 5) 安装训练需要但系统里可能没有的轻量包（幂等，已存在 venv 也会补装缺的）
+"${VENV_DIR}/bin/pip" install \
+    "tensorboard>=2.16.0" \
+    "tiktoken>=0.7.0" \
+    "numpy>=1.26" \
+    "tqdm>=4.66.0" \
+    "datasets<4.0" \
+    "huggingface_hub<0.24" \
+    "fsspec<=2024.5.0" \
+    "pyarrow" \
+    "requests" \
+    "httpx[socks]"
+
+# 6) 最终 sanity check
 "${PY}" - <<'PYEOF'
-import torch, sys
+import sys, torch
 print(f"[env] python = {sys.executable}")
 print(f"[env] torch  = {torch.__version__}  cuda={torch.version.cuda}  n_gpu={torch.cuda.device_count()}")
+import tensorboard, tiktoken, numpy
+print(f"[env] tensorboard={tensorboard.__version__}  tiktoken={tiktoken.__version__}  numpy={numpy.__version__}")
 PYEOF
 
 # 用 `python -m torch.distributed.run` 代替 `torchrun`，省得依赖 $PATH 里的 entry script
