@@ -28,11 +28,15 @@ class GPTConfig:
 # Preset: ~2B parameters. Roughly 12*L*d^2 + vocab*d
 #   depth=32, n_embd=2560  ->  12*32*2560^2 ≈ 2.52B  (+ 128M tied embeddings)
 #   actual count including heads/norms ≈ 2.1–2.2B
+# 8b preset:
+#   depth=40, n_embd=4096  ->  12*40*4096^2 ≈ 8.05B (+ 205M tied embeddings)
+#   fp32 AdamW state ≈ 96GB — single 80GB GPU cannot hold it, requires FSDP sharding.
 PRESETS = {
     "d20":  dict(depth=20, n_embd=1280, n_head=10),   # ~400M
     "d24":  dict(depth=24, n_embd=1792, n_head=14),   # ~900M
     "2b":   dict(depth=32, n_embd=2560, n_head=20),   # ~2.1B
     "3b":   dict(depth=32, n_embd=3072, n_head=24),   # ~3.0B (tight on 80GB)
+    "8b":   dict(depth=40, n_embd=4096, n_head=32),   # ~8.3B (requires FSDP on 8x80GB)
 }
 
 

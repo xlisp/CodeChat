@@ -12,12 +12,25 @@ import torch
 
 
 class PretrainLoader:
-    def __init__(self, data_dir: str, batch_size: int, block_size: int, device: torch.device):
+    def __init__(
+        self,
+        data_dir: str,
+        batch_size: int,
+        block_size: int,
+        device: torch.device,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 1337,
+    ):
         self.shards = sorted(glob.glob(os.path.join(data_dir, "*.bin")))
         assert len(self.shards) > 0, f"no .bin shards found in {data_dir}"
         self.batch_size = batch_size
         self.block_size = block_size
         self.device = device
+        self.rank = rank
+        self.world_size = world_size
+        # each rank gets an independent RNG so DDP ranks see non-overlapping windows
+        self.rng = np.random.default_rng(seed + rank * 9973)
         self._mmaps: dict[str, np.ndarray] = {}
 
     def _load(self, path: str) -> np.ndarray:
@@ -26,8 +39,8 @@ class PretrainLoader:
         return self._mmaps[path]
 
     def next_batch(self):
-        shard = self._load(self.shards[np.random.randint(len(self.shards))])
-        ix = np.random.randint(0, len(shard) - self.block_size - 1, size=(self.batch_size,))
+        shard = self._load(self.shards[self.rng.integers(len(self.shards))])
+        ix = self.rng.integers(0, len(shard) - self.block_size - 1, size=(self.batch_size,))
         x = np.stack([shard[i : i + self.block_size].astype(np.int64) for i in ix])
         y = np.stack([shard[i + 1 : i + 1 + self.block_size].astype(np.int64) for i in ix])
         x = torch.from_numpy(x).to(self.device, non_blocking=True)
