@@ -40,13 +40,13 @@ python -m scripts.chat_rl \
     --group-size 4 \
     --run "${RUN}_rl"
 
-echo "==> [6/7] SWE-bench Lite eval (patch generation only)"
-python -m scripts.eval_swebench \
-    --ckpt "checkpoints/${RUN}_rl/latest.pt" \
-    --split lite \
-    --out "predictions/${RUN}_rl.jsonl" \
-    --model-name "${RUN}-rl" \
-    --limit 50
+#-# echo "==> [6/7] SWE-bench Lite eval (patch generation only)"
+# python -m scripts.eval_swebench \
+#    --ckpt "checkpoints/${RUN}_rl/latest.pt" \
+#    --split lite \
+#    --out "predictions/${RUN}_rl.jsonl" \
+#    --model-name "${RUN}-rl" \
+#    --limit 50
 
 # --- Stage 7: GRPO on SWE-bench train (Docker required, very heavy) ---
 # Uncomment to enable. Requires:
