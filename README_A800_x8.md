@@ -18,8 +18,10 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_train \
     --grad-accum 8 \
     --max-steps 30000 \
     --lr 1.5e-4 --warmup 1000 \
-    --run codechat_8b
+    --run-name codechat_8b
 ```
+
+> ⚠️ **一定用 `--run-name` 而不是 `--run`**：`torchrun` 的 argparse 有个 `--run-path` 选项，看到 `--run` 会判为 "ambiguous option" 然后直接报错（在还没把参数转发给训练脚本之前就挂了）。`--run-name` 不是它任何选项的前缀，才会被透传。base_train/chat_sft/chat_rl 里同时兼容 `--run` (单卡老脚本) 和 `--run-name` (torchrun 场景)。
 
 - 预设 `8b`:  `depth=40, n_embd=4096, n_head=32`, **~8.3B 参数**
 - 分片策略: **FSDP `FULL_SHARD`** (params + grads + AdamW 状态全部按 rank 切 8 份)

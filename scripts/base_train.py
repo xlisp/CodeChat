@@ -76,7 +76,11 @@ def main():
     ap.add_argument("--warmup", type=int, default=500)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--save-every", type=int, default=2000)
-    ap.add_argument("--run", default="codechat_2b")
+    # Primary name is --run-name. --run is kept as an alias for backwards compat
+    # with the single-GPU shell scripts, but DO NOT use --run through torchrun:
+    # torchrun's argparse sees --run as an ambiguous prefix of its --run-path flag
+    # and errors out before forwarding to the training script.
+    ap.add_argument("--run-name", "--run", dest="run", default="codechat_2b")
     ap.add_argument("--ckpt-dir", default="checkpoints")
     ap.add_argument("--tb-dir", default="runs/tb", help="tensorboard log root")
     ap.add_argument("--resume", default=None, help="optional checkpoint to warm-start from (model weights only)")

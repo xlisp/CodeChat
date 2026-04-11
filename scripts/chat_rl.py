@@ -74,7 +74,8 @@ def forward_logps(model: GPT, full_ids: torch.Tensor, prompt_len: int):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sft-ckpt", required=True)
-    ap.add_argument("--run", default="codechat_d20_rl")
+    # see scripts/base_train.py for why --run-name is the primary form
+    ap.add_argument("--run-name", "--run", dest="run", default="codechat_d20_rl")
     ap.add_argument("--ckpt-dir", default="checkpoints")
     ap.add_argument("--max-steps", type=int, default=1000)
     ap.add_argument("--group-size", type=int, default=4, help="completions per prompt")

@@ -79,7 +79,7 @@ torchrun \
         --warmup 1000 \
         --max-steps 30000 \
         --save-every 1000 \
-        --run "$RUN"
+        --run-name "$RUN"
 fi
 
 # ===========================================================================
@@ -111,7 +111,7 @@ torchrun \
         --device-batch-size 1 \
         --grad-accum 8 \
         --max-steps 3000 \
-        --run "${RUN}_sft"
+        --run-name "${RUN}_sft"
 fi
 
 # ===========================================================================
@@ -126,7 +126,7 @@ python -m scripts.chat_rl \
     --sft-ckpt "checkpoints/${RUN}_sft/latest.pt" \
     --max-steps 1000 \
     --group-size 4 \
-    --run "${RUN}_rl"
+    --run-name "${RUN}_rl"
 fi
 
 # ===========================================================================

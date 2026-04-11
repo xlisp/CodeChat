@@ -21,7 +21,8 @@ def main():
     ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--max-steps", type=int, default=3000)
     ap.add_argument("--warmup", type=int, default=100)
-    ap.add_argument("--run", default="codechat_d20_sft")
+    # see scripts/base_train.py for why --run-name is the primary form
+    ap.add_argument("--run-name", "--run", dest="run", default="codechat_d20_sft")
     ap.add_argument("--ckpt-dir", default="checkpoints")
     ap.add_argument("--tb-dir", default="runs/tb", help="tensorboard log root")
     args = ap.parse_args()
