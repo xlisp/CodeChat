@@ -1,3 +1,4 @@
+## python env
 
 ```bash
 rm -rf .venv_train
@@ -12,11 +13,9 @@ pip install -r requirements.txt
 
 bash runs/train_a800_x8.sh
 
-## download dataset by proxy:
-
-pip install ipython
-
 ```
+
+## download dataset by proxy: `pip install ipython`
 
 ```py
 from datasets import load_dataset
