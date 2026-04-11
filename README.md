@@ -60,6 +60,8 @@ pip install -r requirements.txt
 bash runs/train_a800.sh
 ```
 
+> 如果你有 **8x A800** 并想把模型放大到 **8B**，请看独立文档 [`README_A800_x8.md`](README_A800_x8.md) — 里面讲了 FSDP 分片、显存预算、`runs/train_a800_x8.sh` 的用法和与本路线的差异。
+
 该脚本依次执行：
 
 1. `scripts/prepare_pretrain.py`   下载并分片预训练语料（约 5–10GB，可通过 `--max-shards` 控制）
