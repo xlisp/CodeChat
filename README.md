@@ -52,8 +52,10 @@ pip install -r requirements.txt
 | SFT 混合 | [`sahil2801/CodeAlpaca-20k`](https://huggingface.co/datasets/sahil2801/CodeAlpaca-20k) | 2w 条通用代码指令 |
 | RL | [`mbpp`](https://huggingface.co/datasets/google-research-datasets/mbpp) (sanitized) | 带 `test_list` 的 Python 题目，可执行验证 |
  
+## SFT QA & prompt list
 ![](./SFT_QA_list_example.png)
 
+### RL QA & Test list
 ![](./RL_QA_test_list_example.png)
 
 分词器直接复用 GPT-2 BPE（`tiktoken` 的 `gpt2` 编码），在代码场景下压缩率足够，无需另行训练。
