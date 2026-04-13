@@ -133,7 +133,7 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 if [ "$SKIP_TO" -le 1 ]; then
 echo "==> [1/5] preparing pretraining shards"
 # 首次运行取消注释 (16 个 shard ~ 8.1G, 如数据已就位可跳过):
-### OUT_DIR=data/pretrain MAX_SHARDS=16 bash runs/prepare_pretrain_venv.sh
+##DONE# OUT_DIR=data/pretrain MAX_SHARDS=16 bash runs/prepare_pretrain_venv.sh
 fi
 
 # ===========================================================================
@@ -144,25 +144,26 @@ fi
 #   - global batch = 1 * 8 * 8 * 2048 = 131k tokens / step
 #   - 30k steps ≈ 3.9B tokens seen (与 2B run 相当量级)
 # ===========================================================================
-if [ "$SKIP_TO" -le 2 ]; then
-echo "==> [2/5] pretraining 8B (preset=$PRESET, FSDP x$NPROC)"
-"${TORCHRUN_CMD[@]}" \
-    --standalone \
-    --nproc_per_node="$NPROC" \
-    --master_addr="$MASTER_ADDR" \
-    --master_port="$MASTER_PORT" \
-    -m scripts.base_train \
-        --data-dir data/pretrain \
-        --preset "$PRESET" \
-        --block-size 2048 \
-        --device-batch-size 1 \
-        --grad-accum 8 \
-        --lr 1.5e-4 \
-        --warmup 1000 \
-        --max-steps 30000 \
-        --save-every 1000 \
-        --run-name "$RUN"
-fi
+### DONE: 预训练结束
+##if [ "$SKIP_TO" -le 2 ]; then
+##echo "==> [2/5] pretraining 8B (preset=$PRESET, FSDP x$NPROC)"
+##"${TORCHRUN_CMD[@]}" \
+##    --standalone \
+##    --nproc_per_node="$NPROC" \
+##    --master_addr="$MASTER_ADDR" \
+##    --master_port="$MASTER_PORT" \
+##    -m scripts.base_train \
+##        --data-dir data/pretrain \
+##        --preset "$PRESET" \
+##        --block-size 2048 \
+##        --device-batch-size 1 \
+##        --grad-accum 8 \
+##        --lr 1.5e-4 \
+##        --warmup 1000 \
+##        --max-steps 30000 \
+##        --save-every 1000 \
+##        --run-name "$RUN"
+##fi
 
 # ===========================================================================
 # Stage 3: SFT data preparation
