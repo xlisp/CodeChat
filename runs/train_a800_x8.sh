@@ -170,30 +170,31 @@ fi
 # ===========================================================================
 if [ "$SKIP_TO" -le 3 ]; then
 echo "==> [3/5] preparing SFT data"
-"${PY}" -m scripts.prepare_sft --out-dir data/sft
+### "${PY}" -m scripts.prepare_sft --out-dir data/sft ## DONE: 72M     data/sft/train.jsonl
 fi
 
 # ===========================================================================
 # Stage 4: SFT — 8B also needs FSDP (optimizer states blow single card otherwise)
 #
 # 注意: scripts.chat_sft 当前还没加 FSDP 支持。若未打 FSDP 补丁，这一步
-# 在 8B 会 OOM。可先用 d24 预设过 pipeline，或等 chat_sft.py 跟进分布式改动。
+# 在 8B 会 OOM。可先用 d24 预设过 pipeline，或等 chat_sft.py 跟进分布式改动。 => DONE: https://github.com/xlisp/CodeChat/commit/bc8c26b1fa2c7322c0034bc18bf39167619a15b5
 # ===========================================================================
-if [ "$SKIP_TO" -le 4 ]; then
-echo "==> [4/5] SFT 8B (FSDP x$NPROC)"
-"${TORCHRUN_CMD[@]}" \
-    --standalone \
-    --nproc_per_node="$NPROC" \
-    --master_addr="$MASTER_ADDR" \
-    --master_port="$MASTER_PORT" \
-    -m scripts.chat_sft \
-        --base-ckpt "checkpoints/${RUN}/latest.pt" \
-        --data-dir data/sft \
-        --device-batch-size 1 \
-        --grad-accum 8 \
-        --max-steps 3000 \
-        --run-name "${RUN}_sft"
-fi
+# DONE: 16G     checkpoints/codechat_8b_sft/latest.pt
+##if [ "$SKIP_TO" -le 4 ]; then
+##echo "==> [4/5] SFT 8B (FSDP x$NPROC)"
+##"${TORCHRUN_CMD[@]}" \
+##    --standalone \
+##    --nproc_per_node="$NPROC" \
+##    --master_addr="$MASTER_ADDR" \
+##    --master_port="$MASTER_PORT" \
+##    -m scripts.chat_sft \
+##        --base-ckpt "checkpoints/${RUN}/latest.pt" \
+##        --data-dir data/sft \
+##        --device-batch-size 1 \
+##        --grad-accum 8 \
+##        --max-steps 3000 \
+##        --run-name "${RUN}_sft"
+##fi
 
 # ===========================================================================
 # Stage 5: RL (GRPO on MBPP, executable reward)
