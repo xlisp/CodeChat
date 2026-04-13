@@ -15,7 +15,7 @@
 | 2 — 预训练 (8B, FSDP×8) | `scripts/base_train.py` | **DONE** | ~48.9h |
 | 3 — SFT 数据准备 | `scripts/prepare_sft.py` | **DONE** | — |
 | 4 — SFT (8B, FSDP×8) | `scripts/chat_sft.py` | **DONE** | ~4.8h |
-| 5 — RL / GRPO (MBPP) | `scripts/chat_rl.py` | **FAILED — OOM** | — |
+| 5 — RL / GRPO (MBPP) | `scripts/chat_rl.py` | **FIXED — 待重跑** | — |
 
 ---
 
@@ -220,6 +220,24 @@ Process has 79.30 GiB memory in use.
 
 **推荐方案**: 方案 1 (FSDP)，复用 `chat_sft.py` 已有的分布式代码。
 
+### 5.5 已应用修复
+
+已为 `scripts/chat_rl.py` 增加 FSDP 支持，改动与 `chat_sft.py` 一致：
+
+- 加入 `setup_distributed()` + `wrap_fsdp()` — 自动检测 torchrun 环境，FSDP FULL_SHARD 包装 policy 和 ref 模型
+- Checkpoint 改为 `map_location="cpu"` 加载，避免多进程争抢 GPU 0
+- 采样阶段 (`sample_one`) 加入 `dist.broadcast(nxt, src=0)` 保证所有 rank 采样同一 token
+- MBPP 问题索引通过 `dist.broadcast` 同步
+- 梯度裁剪改用 FSDP 的 `clip_grad_norm_()`
+- TensorBoard / print 仅 rank 0 执行
+- 训练结束加入 `dist.barrier()` + `dist.destroy_process_group()`
+- `runs/train_a800_x8.sh` 中 RL 阶段改为 `torchrun --nproc_per_node=8` 启动
+
+重跑命令：
+```bash
+SKIP_TO=5 bash runs/train_a800_x8.sh
+```
+
 ---
 
 ## 6. 2B vs 8B 对比
@@ -320,6 +338,6 @@ tensorboard --logdir runs/tb
 
 1. **预训练完成**: 8B 模型 30k 步训练，loss 从 11.37 收敛至 0.61，曲线平滑无发散。
 2. **SFT 完成**: 3,000 步微调，loss 降至 0.12，收敛良好。Checkpoint 已保存 (16GB)。
-3. **RL 阶段失败**: `chat_rl.py` 为单 GPU 设计，8B 模型需同时加载 policy + ref 两个副本加上 Adam 状态，总显存需求 ~106GB，远超单卡 80GB。需要改造为 FSDP 多卡训练。
+3. **RL 阶段已修复**: `chat_rl.py` 原为单 GPU 设计导致 OOM (policy+ref+Adam ~106GB > 80GB)，已加入 FSDP 支持，待重跑。
 4. **规模效果显著**: 8B 比 2B 在预训练 loss 上有质的提升 (0.61 vs 0.87)。
-5. **下一步**: 为 `scripts/chat_rl.py` 增加 FSDP 支持（参考 `chat_sft.py` 的改动），然后重新运行 RL 阶段。
+5. **下一步**: 运行 `SKIP_TO=5 bash runs/train_a800_x8.sh` 重跑 RL 阶段。

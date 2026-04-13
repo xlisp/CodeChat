@@ -6,23 +6,66 @@ reference test asserts in a subprocess, and use (reward - group_mean) /
 KL penalty toward a frozen reference model to keep the policy near the SFT
 checkpoint.
 
-Single-GPU, bf16, A800 80GB friendly.
+Supports both single-GPU and multi-GPU (FSDP) training.  Launch mode is
+auto-detected from torchrun env vars, identical to chat_sft.py.
+
+  Single GPU:  python -m scripts.chat_rl --sft-ckpt ...
+  8x A800:     torchrun --nproc_per_node=8 -m scripts.chat_rl --sft-ckpt ...
 """
 import argparse
+import functools
 import glob
 import os
 import time
 import copy
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 
-from codechat.common import DEVICE, COMPUTE_DTYPE, seed_all
-from codechat.gpt import GPT, GPTConfig
+from codechat.common import COMPUTE_DTYPE, seed_all
+from codechat.gpt import GPT, GPTConfig, Block
 from codechat.optim import build_optimizer, cosine_lr
 from codechat.checkpoint import save as save_ckpt, load as load_ckpt
 from codechat.tokenizer import encode, decode, USER_TAG, ASSISTANT_TAG, END_TAG
 from codechat.execution import run_with_tests, extract_code
+
+
+def setup_distributed():
+    """Detect torchrun and initialise NCCL. Returns (is_dist, local_rank, rank, world_size)."""
+    if "LOCAL_RANK" not in os.environ:
+        return False, 0, 0, 1
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return True, local_rank, dist.get_rank(), dist.get_world_size()
+
+
+def wrap_fsdp(model):
+    """Wrap the model with FSDP, sharding at the transformer Block boundary."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, BackwardPrefetch
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+    auto_wrap = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={Block},
+    )
+    mp_policy = MixedPrecision(
+        param_dtype=COMPUTE_DTYPE,
+        reduce_dtype=COMPUTE_DTYPE,
+        buffer_dtype=COMPUTE_DTYPE,
+    )
+    return FSDP(
+        model,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        mixed_precision=mp_policy,
+        auto_wrap_policy=auto_wrap,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        device_id=torch.cuda.current_device(),
+        use_orig_params=True,
+        limit_all_gathers=True,
+    )
 
 
 def build_prompt(problem: str) -> str:
@@ -33,15 +76,21 @@ def build_prompt(problem: str) -> str:
     return f"{USER_TAG}\n{user}\n{END_TAG}\n{ASSISTANT_TAG}\n"
 
 
-def sample_one(model: GPT, prompt_ids: torch.Tensor, max_new: int, temperature: float, top_k: int):
-    """Sample a single completion. Returns (token_ids [T_new], logprobs [T_new])."""
+def sample_one(model: GPT, prompt_ids: torch.Tensor, max_new: int,
+               temperature: float, top_k: int, block_size: int, is_dist: bool = False):
+    """Sample a single completion. Returns (token_ids [T_new], logprobs [T_new]).
+
+    When running under FSDP (is_dist=True), all ranks must call this together
+    (FSDP forward requires collective participation).  The sampled token is
+    broadcast from rank 0 so every rank stays in sync.
+    """
     model.eval()
     ids = prompt_ids.clone()
     new_ids, new_logps = [], []
     eot_str_ids = set(encode(END_TAG))
     with torch.no_grad():
         for _ in range(max_new):
-            cond = ids[:, -model.cfg.block_size:]
+            cond = ids[:, -block_size:]
             logits, _ = model(cond)
             logits = logits[:, -1, :].float() / max(temperature, 1e-5)
             if top_k is not None:
@@ -50,6 +99,9 @@ def sample_one(model: GPT, prompt_ids: torch.Tensor, max_new: int, temperature: 
             logp_full = F.log_softmax(logits, dim=-1)
             probs = logp_full.exp()
             nxt = torch.multinomial(probs, 1)
+            # Ensure all FSDP ranks sample the same token
+            if is_dist:
+                dist.broadcast(nxt, src=0)
             lp = logp_full.gather(-1, nxt)
             new_ids.append(nxt.item())
             new_logps.append(lp.item())
@@ -98,29 +150,48 @@ def main():
     )
     args = ap.parse_args()
 
+    is_dist, local_rank, rank, world_size = setup_distributed()
+    is_master = (rank == 0)
+
     seed_all(1337)
-    assert DEVICE.type == "cuda"
+    device = torch.device("cuda", local_rank) if is_dist else torch.device("cuda")
+    assert device.type == "cuda"
     torch.set_float32_matmul_precision("high")
 
-    state = load_ckpt(args.sft_ckpt)
+    # Load checkpoint to CPU so all ranks don't compete for GPU 0 memory.
+    state = load_ckpt(args.sft_ckpt, map_location="cpu")
     cfg = GPTConfig(**state["cfg"])
-    policy = GPT(cfg).to(DEVICE).to(COMPUTE_DTYPE)
+
+    policy = GPT(cfg)
     policy.load_state_dict(state["model"])
-    ref = GPT(cfg).to(DEVICE).to(COMPUTE_DTYPE)
+    ref = GPT(cfg)
     ref.load_state_dict(state["model"])
+    del state  # free CPU memory
+
+    policy = policy.to(device).to(COMPUTE_DTYPE)
+    ref = ref.to(device).to(COMPUTE_DTYPE)
     for p in ref.parameters():
         p.requires_grad = False
     ref.eval()
 
+    if is_dist:
+        policy = wrap_fsdp(policy)
+        ref = wrap_fsdp(ref)
+
+    if is_master:
+        print(f"loaded sft ckpt {args.sft_ckpt}")
+
     from datasets import load_dataset
     mbpp = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
-    print(f"loaded {len(mbpp)} MBPP problems")
+    if is_master:
+        print(f"loaded {len(mbpp)} MBPP problems")
 
     optim = build_optimizer(policy, lr=args.lr)
     ckpt_path = os.path.join(args.ckpt_dir, args.run, "latest.pt")
     tb_path = os.path.join(args.tb_dir, args.run)
-    writer = SummaryWriter(log_dir=tb_path)
-    print(f"tensorboard -> {tb_path}")
+    writer = SummaryWriter(log_dir=tb_path) if is_master else None
+    if is_master:
+        print(f"tensorboard -> {tb_path}")
     t0 = time.time()
 
     for step in range(1, args.max_steps + 1):
@@ -128,11 +199,15 @@ def main():
         for g in optim.param_groups:
             g["lr"] = lr
 
-        ex = mbpp[int(torch.randint(0, len(mbpp), (1,)).item())]
+        # All ranks must pick the same problem — broadcast index from rank 0.
+        idx = torch.randint(0, len(mbpp), (1,), device=device)
+        if is_dist:
+            dist.broadcast(idx, src=0)
+        ex = mbpp[idx.item()]
         problem = ex["prompt"]
         tests = ex["test_list"]
         prompt = build_prompt(problem)
-        prompt_ids = torch.tensor([encode(prompt)], dtype=torch.long, device=DEVICE)
+        prompt_ids = torch.tensor([encode(prompt)], dtype=torch.long, device=device)
         prompt_len = prompt_ids.shape[1]
         if prompt_len > cfg.block_size - args.max_new_tokens:
             continue
@@ -141,7 +216,8 @@ def main():
         rollouts = []  # list of (full_ids, reward)
         for _ in range(args.group_size):
             new_ids, _old_lp, full_ids = sample_one(
-                policy, prompt_ids, args.max_new_tokens, args.temperature, args.top_k
+                policy, prompt_ids, args.max_new_tokens, args.temperature, args.top_k,
+                block_size=cfg.block_size, is_dist=is_dist,
             )
             text = decode(new_ids)
             if END_TAG in text:
@@ -150,7 +226,7 @@ def main():
             reward = run_with_tests(code, tests)
             rollouts.append((full_ids, reward))
 
-        rewards = torch.tensor([r for _, r in rollouts], dtype=torch.float32, device=DEVICE)
+        rewards = torch.tensor([r for _, r in rollouts], dtype=torch.float32, device=device)
         adv = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
 
         # ---- PG + KL update ----
@@ -172,23 +248,27 @@ def main():
             total_loss += loss.item() / args.group_size
             total_pg += pg.item() / args.group_size
             total_kl += kl.item() / args.group_size
-        grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.clip * 5)
+        if is_dist and hasattr(policy, "clip_grad_norm_"):
+            grad_norm = policy.clip_grad_norm_(args.clip * 5)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), args.clip * 5)
         optim.step()
 
-        writer.add_scalar("rl/reward_mean", rewards.mean().item(), step)
-        writer.add_scalar("rl/reward_max", rewards.max().item(), step)
-        writer.add_scalar("rl/reward_min", rewards.min().item(), step)
-        writer.add_scalar("rl/reward_std", rewards.std().item(), step)
-        writer.add_scalar("rl/advantage_abs_mean", adv.abs().mean().item(), step)
-        writer.add_scalar("rl/loss_total", total_loss, step)
-        writer.add_scalar("rl/loss_pg", total_pg, step)
-        writer.add_scalar("rl/kl", total_kl, step)
-        writer.add_scalar("rl/lr", lr, step)
-        writer.add_scalar("rl/grad_norm", float(grad_norm), step)
-        writer.add_scalar("rl/prompt_len", prompt_len, step)
-        writer.add_scalar("rl/elapsed_s", time.time() - t0, step)
+        if is_master:
+            writer.add_scalar("rl/reward_mean", rewards.mean().item(), step)
+            writer.add_scalar("rl/reward_max", rewards.max().item(), step)
+            writer.add_scalar("rl/reward_min", rewards.min().item(), step)
+            writer.add_scalar("rl/reward_std", rewards.std().item(), step)
+            writer.add_scalar("rl/advantage_abs_mean", adv.abs().mean().item(), step)
+            writer.add_scalar("rl/loss_total", total_loss, step)
+            writer.add_scalar("rl/loss_pg", total_pg, step)
+            writer.add_scalar("rl/kl", total_kl, step)
+            writer.add_scalar("rl/lr", lr, step)
+            writer.add_scalar("rl/grad_norm", float(grad_norm), step)
+            writer.add_scalar("rl/prompt_len", prompt_len, step)
+            writer.add_scalar("rl/elapsed_s", time.time() - t0, step)
 
-        if step % 5 == 0:
+        if step % 5 == 0 and is_master:
             print(
                 f"rl step {step:5d} | reward {rewards.mean().item():.3f} "
                 f"(max {rewards.max().item():.2f}) | loss {total_loss:.4f} "
@@ -213,8 +293,13 @@ def main():
                             os.remove(p)
                         except OSError:
                             pass
-            print(f"  saved -> {ckpt_path} and {step_path}")
-    writer.close()
+            if is_master:
+                print(f"  saved -> {ckpt_path} and {step_path}")
+    if is_master:
+        writer.close()
+    if is_dist:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

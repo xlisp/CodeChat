@@ -200,12 +200,17 @@ fi
 # Stage 5: RL (GRPO on MBPP, executable reward)
 # ===========================================================================
 if [ "$SKIP_TO" -le 5 ]; then
-echo "==> [5/5] RL — GRPO on MBPP"
-"${PY}" -m scripts.chat_rl \
-    --sft-ckpt "checkpoints/${RUN}_sft/latest.pt" \
-    --max-steps 1000 \
-    --group-size 4 \
-    --run-name "${RUN}_rl"
+echo "==> [5/5] RL — GRPO on MBPP (FSDP x$NPROC)"
+"${TORCHRUN_CMD[@]}" \
+    --standalone \
+    --nproc_per_node="$NPROC" \
+    --master_addr="$MASTER_ADDR" \
+    --master_port="$MASTER_PORT" \
+    -m scripts.chat_rl \
+        --sft-ckpt "checkpoints/${RUN}_sft/latest.pt" \
+        --max-steps 1000 \
+        --group-size 4 \
+        --run-name "${RUN}_rl"
 fi
 
 # ===========================================================================
