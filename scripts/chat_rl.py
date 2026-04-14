@@ -15,6 +15,7 @@ auto-detected from torchrun env vars, identical to chat_sft.py.
 import argparse
 import functools
 import glob
+import json
 import os
 import time
 import copy
@@ -29,6 +30,26 @@ from codechat.optim import build_optimizer, cosine_lr
 from codechat.checkpoint import save as save_ckpt, load as load_ckpt
 from codechat.tokenizer import encode, decode, USER_TAG, ASSISTANT_TAG, END_TAG
 from codechat.execution import run_with_tests, extract_code
+
+
+def load_problems(problems_file: str | None):
+    """Return a list of {'prompt': str, 'test_list': list[str]}.
+
+    If problems_file is given, read it as jsonl (produced by
+    scripts/filter_mbpp_by_passrate.py). Otherwise fall back to the full
+    MBPP sanitized train split.
+    """
+    if problems_file and os.path.exists(problems_file):
+        items = []
+        with open(problems_file) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    items.append(json.loads(line))
+        return items
+    from datasets import load_dataset
+    mbpp = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
+    return [{"prompt": ex["prompt"], "test_list": ex["test_list"]} for ex in mbpp]
 
 
 def setup_distributed():
@@ -130,7 +151,9 @@ def main():
     ap.add_argument("--run-name", "--run", dest="run", default="codechat_d20_rl")
     ap.add_argument("--ckpt-dir", default="checkpoints")
     ap.add_argument("--max-steps", type=int, default=1000)
-    ap.add_argument("--group-size", type=int, default=4, help="completions per prompt")
+    ap.add_argument("--group-size", type=int, default=8,
+                    help="completions per prompt. 8 gives group-variance even "
+                         "at ~2-3%% per-problem pass rate; 4 is too small.")
     ap.add_argument("--max-new-tokens", type=int, default=384)
     ap.add_argument("--temperature", type=float, default=0.9)
     ap.add_argument("--top-k", type=int, default=50)
@@ -138,6 +161,18 @@ def main():
     ap.add_argument("--kl-coef", type=float, default=0.02)
     ap.add_argument("--clip", type=float, default=0.2)
     ap.add_argument("--tb-dir", default="runs/tb", help="tensorboard log root")
+    ap.add_argument("--reward-mode", choices=("binary", "fractional", "tiered"),
+                    default="tiered",
+                    help="binary: 1.0 iff all tests pass, else 0.0. "
+                         "fractional: passed / total. "
+                         "tiered (default): staircase with partial credit for "
+                         "parseable / runnable code (see codechat/execution.py).")
+    ap.add_argument("--problems-file", default=None,
+                    help="jsonl of {prompt,test_list} (from filter_mbpp_by_passrate). "
+                         "If unset, use full MBPP sanitized train split.")
+    ap.add_argument("--log-rollouts-every", type=int, default=50,
+                    help="every N steps, print one decoded rollout + its reward "
+                         "(master rank only). Set 0 to disable.")
     ap.add_argument(
         "--save-every", type=int, default=50,
         help="save step_{step:06d}.pt every N steps (in addition to latest.pt)",
@@ -181,10 +216,11 @@ def main():
     if is_master:
         print(f"loaded sft ckpt {args.sft_ckpt}")
 
-    from datasets import load_dataset
-    mbpp = load_dataset("google-research-datasets/mbpp", "sanitized", split="train")
+    problems = load_problems(args.problems_file)
     if is_master:
-        print(f"loaded {len(mbpp)} MBPP problems")
+        src = args.problems_file or "google-research-datasets/mbpp:train"
+        print(f"loaded {len(problems)} problems from {src}")
+        print(f"reward_mode={args.reward_mode}  group_size={args.group_size}")
 
     optim = build_optimizer(policy, lr=args.lr)
     ckpt_path = os.path.join(args.ckpt_dir, args.run, "latest.pt")
@@ -200,10 +236,10 @@ def main():
             g["lr"] = lr
 
         # All ranks must pick the same problem — broadcast index from rank 0.
-        idx = torch.randint(0, len(mbpp), (1,), device=device)
+        idx = torch.randint(0, len(problems), (1,), device=device)
         if is_dist:
             dist.broadcast(idx, src=0)
-        ex = mbpp[idx.item()]
+        ex = problems[idx.item()]
         problem = ex["prompt"]
         tests = ex["test_list"]
         prompt = build_prompt(problem)
@@ -213,7 +249,7 @@ def main():
             continue
 
         # ---- sample a group of completions and score ----
-        rollouts = []  # list of (full_ids, reward)
+        rollouts = []  # list of (full_ids, reward, decoded_text)
         for _ in range(args.group_size):
             new_ids, _old_lp, full_ids = sample_one(
                 policy, prompt_ids, args.max_new_tokens, args.temperature, args.top_k,
@@ -223,10 +259,14 @@ def main():
             if END_TAG in text:
                 text = text.split(END_TAG)[0]
             code = extract_code(text)
-            reward = run_with_tests(code, tests)
-            rollouts.append((full_ids, reward))
+            if args.reward_mode == "binary":
+                r_frac = run_with_tests(code, tests, mode="fractional")
+                reward = 1.0 if r_frac >= 0.999 else 0.0
+            else:
+                reward = run_with_tests(code, tests, mode=args.reward_mode)
+            rollouts.append((full_ids, reward, text))
 
-        rewards = torch.tensor([r for _, r in rollouts], dtype=torch.float32, device=device)
+        rewards = torch.tensor([r for _, r, _ in rollouts], dtype=torch.float32, device=device)
         adv = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
 
         # ---- PG + KL update ----
@@ -235,7 +275,7 @@ def main():
         total_loss = 0.0
         total_pg = 0.0
         total_kl = 0.0
-        for (full_ids, _), a in zip(rollouts, adv):
+        for (full_ids, _, _), a in zip(rollouts, adv):
             logp_pol = forward_logps(policy, full_ids, prompt_len)
             with torch.no_grad():
                 logp_ref = forward_logps(ref, full_ids, prompt_len)
@@ -274,6 +314,30 @@ def main():
                 f"(max {rewards.max().item():.2f}) | loss {total_loss:.4f} "
                 f"| lr {lr:.2e} | {time.time()-t0:.0f}s"
             )
+
+        # Periodically dump one rollout so we can eyeball what the model is
+        # actually generating — essential when reward stays flat.
+        if (args.log_rollouts_every and is_master
+                and step % args.log_rollouts_every == 0):
+            # Pick the best rollout in this group so we see near-successes, not random noise.
+            best_i = int(torch.argmax(rewards).item())
+            best_r = rewards[best_i].item()
+            best_text = rollouts[best_i][2]
+            snippet = best_text[:800].replace("\n", "\n    ")
+            print(
+                f"  [rollout @ step {step}] best_reward={best_r:.3f}  "
+                f"(rewards={[round(r, 3) for r in rewards.tolist()]})\n"
+                f"    prompt: {problem[:200]!r}\n"
+                f"    tests:  {tests[:1]}\n"
+                f"    best output >>>\n    {snippet}\n    <<<"
+            )
+            if writer is not None:
+                writer.add_text(
+                    f"rl/rollout_best",
+                    f"step {step} | reward {best_r:.3f}\n\n"
+                    f"prompt:\n{problem}\n\ntests:\n{tests}\n\noutput:\n{best_text[:2000]}",
+                    step,
+                )
         if step % args.save_every == 0 or step == args.max_steps:
             save_ckpt(ckpt_path, policy, optim, step, cfg)
             step_path = os.path.join(args.ckpt_dir, args.run, f"step_{step:06d}.pt")

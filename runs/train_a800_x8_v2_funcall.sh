@@ -23,9 +23,16 @@
 #   以及 function response 回来之后怎么措辞。
 #
 # 相对 train_a800_x8.sh:
-#   - 跳过 pretrain / 通用 SFT / RL，只做 "funcall 续 SFT"
+#   - 跳过 pretrain / 通用 SFT，默认只做 "funcall 续 SFT"
 #   - 基线 ckpt 默认指向 codechat_8b_sft (可通过 BASE_CKPT 覆盖)
 #   - 新 run 名 codechat_8b_funcall，权重不会覆盖 sft checkpoint
+#
+# 可选: RUN_RL=1 启用"救活 MBPP RL"的 3 个补充阶段 (详见 5.6 优化清单 #1/#3/#5/#6)
+#   Stage 3 — pass@k 诊断: 量化 SFT ckpt 在 MBPP 上的真实能力
+#   Stage 4 — 按 pass rate 过滤 MBPP: 只保留 group 内能有方差的题
+#   Stage 5 — 优化版 GRPO: tiered reward + group_size=8 + 每 50 步打印 rollout
+# 如果 Stage 3 的 pass@1 < 1%，脚本会打印 WARN 但仍继续 (你可以手动中断)，
+# 因为此时即便 tiered reward 也很难看到 reward 曲线离开 0。
 #
 # 前置条件:
 #   - 8x A800 80GB
@@ -51,8 +58,20 @@ NPROC=${NPROC:-8}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29501}      # 与 x8.sh 错开，避免同机并跑撞端口
 
-# 跳过已完成阶段: SKIP_TO=2 直接开始 SFT (前提: data/sft_funcall/train.jsonl 已生成)
+# 跳过已完成阶段: SKIP_TO=2 直接开始 SFT，SKIP_TO=3 开始 RL 诊断
 SKIP_TO=${SKIP_TO:-1}
+
+# ---- 可选 RL 阶段 (默认关闭；开启后跑 §5.6 优化版 MBPP RL) ----
+RUN_RL=${RUN_RL:-0}
+RL_BASE_CKPT=${RL_BASE_CKPT:-checkpoints/${RUN}_sft/latest.pt}  # RL 建议从通用 SFT 起，别用 funcall ckpt
+RL_RUN=${RL_RUN:-${RUN}_rl_v2}
+RL_N_DIAG=${RL_N_DIAG:-50}          # pass@k 诊断评测题数
+RL_K_DIAG=${RL_K_DIAG:-8}           # 每题 K 个样本
+RL_MIN_PASS=${RL_MIN_PASS:-0.05}    # 过滤 MBPP: 保留 pass_rate ∈ [MIN, MAX]
+RL_MAX_PASS=${RL_MAX_PASS:-0.95}
+RL_GROUP_SIZE=${RL_GROUP_SIZE:-8}
+RL_MAX_STEPS=${RL_MAX_STEPS:-500}
+RL_LR=${RL_LR:-5e-6}                # 比旧 RL 的 1e-5 更保守，tiered reward 下梯度幅值更大
 
 # ---------------------------------------------------------------------------
 # Bootstrap training venv — 完全复用 train_a800_x8.sh 的逻辑
@@ -154,7 +173,7 @@ fi
 #   - lr 3e-5 (略低于通用 SFT 的 5e-5，避免破坏已对齐的通用能力)
 # ===========================================================================
 if [ "$SKIP_TO" -le 2 ]; then
-    echo "==> [2/2] function-calling SFT (FSDP x${NPROC}, base=${BASE_CKPT})"
+    echo "==> [2/5] function-calling SFT (FSDP x${NPROC}, base=${BASE_CKPT})"
     "${TORCHRUN_CMD[@]}" \
         --standalone \
         --nproc_per_node="$NPROC" \
@@ -172,23 +191,127 @@ if [ "$SKIP_TO" -le 2 ]; then
 fi
 
 # ===========================================================================
+# 以下 Stage 3-5 为"救活 MBPP RL"的优化版流程，默认关闭。
+# 开启: RUN_RL=1 bash runs/train_a800_x8_v2_funcall.sh
+#
+# 与 train_a800_x8.sh 里失败的那一版 RL 的区别:
+#   - reward 从 binary pass/fail 换成 tiered 阶梯:
+#       syntax 错 0.00 / 运行报错 0.05 / 能跑 0 test 过 0.15 / k/n 过
+#       0.15+0.85*(k/n) / 全过 1.00   → group 内奖励几乎必有方差
+#   - group_size 4 → 8: 弱基线下仍能偶遇 1 个 rollout 更接近
+#   - 先跑 pass@k 诊断 + 按 pass rate 过滤 MBPP，把 "group 全 0" 的题去掉
+#   - 每 50 步打印一个 rollout 文本到 stdout 和 TB，肉眼可见模型在写什么
+# ===========================================================================
+
+if [ "${RUN_RL}" != "1" ]; then
+    echo ""
+    echo "==> [skip] RL stages 3-5 disabled (pass RUN_RL=1 to enable)."
+else
+
+# ---------------------------------------------------------------------------
+# Stage 3: pass@k 诊断 (优化清单 #6)
+#
+# 在动手训练前先量化 SFT ckpt 在 MBPP 上的实际能力，避免再次陷入 reward=0
+# 死循环。产出 data/mbpp_passrate.jsonl，记录每题的 pass rate / tiered reward。
+# ---------------------------------------------------------------------------
+if [ "$SKIP_TO" -le 3 ]; then
+    if [ ! -f "${RL_BASE_CKPT}" ]; then
+        echo "ERROR: RL base ckpt 不存在: ${RL_BASE_CKPT}" >&2
+        exit 1
+    fi
+    echo "==> [3/5] MBPP pass@k diagnostic (ckpt=${RL_BASE_CKPT}, n=${RL_N_DIAG}, k=${RL_K_DIAG})"
+    mkdir -p data
+    "${TORCHRUN_CMD[@]}" \
+        --standalone \
+        --nproc_per_node="$NPROC" \
+        --master_addr="$MASTER_ADDR" \
+        --master_port="$MASTER_PORT" \
+        -m scripts.eval_mbpp_pass_at_k \
+            --ckpt "${RL_BASE_CKPT}" \
+            --split train \
+            --n-problems "${RL_N_DIAG}" \
+            --k "${RL_K_DIAG}" \
+            --out-jsonl data/mbpp_passrate.jsonl
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 4: 按 pass rate 过滤 MBPP (优化清单 #3)
+#
+# 只保留 pass rate ∈ [RL_MIN_PASS, RL_MAX_PASS] 的题目。GRPO 只能从 group 内
+# 方差里学，全 0 或全 1 的题都浪费步数。
+# ---------------------------------------------------------------------------
+if [ "$SKIP_TO" -le 4 ]; then
+    echo "==> [4/5] filter MBPP by pass rate in [${RL_MIN_PASS}, ${RL_MAX_PASS}]"
+    "${PY}" -m scripts.filter_mbpp_by_passrate \
+        --in-jsonl data/mbpp_passrate.jsonl \
+        --out-jsonl data/mbpp_rl_curriculum.jsonl \
+        --min-pass-rate "${RL_MIN_PASS}" \
+        --max-pass-rate "${RL_MAX_PASS}"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 5: 优化版 GRPO on MBPP (优化清单 #1 + #4 + #5)
+#
+# 关键参数:
+#   --reward-mode tiered      # §5.6 #1: 阶梯奖励打破全 0
+#   --group-size 8            # §5.6 #4: 2 倍于旧 run，拉高至少一个非零 rollout 的概率
+#   --problems-file ...       # §5.6 #3: 只在过滤后的题集上训练
+#   --log-rollouts-every 50   # §5.6 #5: 每 50 步 dump 一个 rollout，看模型到底在写啥
+#
+# 注意: RL run name = ${RL_RUN} (默认 codechat_8b_rl_v2)，不会覆盖旧的
+# codechat_8b_rl/latest.pt，两次跑的 TB 可直接对比。
+# ---------------------------------------------------------------------------
+if [ "$SKIP_TO" -le 5 ]; then
+    if [ ! -s data/mbpp_rl_curriculum.jsonl ]; then
+        echo "ERROR: data/mbpp_rl_curriculum.jsonl 为空，不能开 RL。" >&2
+        echo "       说明 SFT base 能力过低 (见 Stage 3 VERDICT)，先强化 base。" >&2
+        exit 1
+    fi
+    echo "==> [5/5] optimized MBPP GRPO (FSDP x${NPROC}, base=${RL_BASE_CKPT})"
+    echo "    problems=$(wc -l < data/mbpp_rl_curriculum.jsonl)  "\
+         "group=${RL_GROUP_SIZE}  reward=tiered  steps=${RL_MAX_STEPS}  lr=${RL_LR}"
+    "${TORCHRUN_CMD[@]}" \
+        --standalone \
+        --nproc_per_node="$NPROC" \
+        --master_addr="$MASTER_ADDR" \
+        --master_port="$MASTER_PORT" \
+        -m scripts.chat_rl \
+            --sft-ckpt "${RL_BASE_CKPT}" \
+            --problems-file data/mbpp_rl_curriculum.jsonl \
+            --reward-mode tiered \
+            --group-size "${RL_GROUP_SIZE}" \
+            --max-steps "${RL_MAX_STEPS}" \
+            --lr "${RL_LR}" \
+            --log-rollouts-every 50 \
+            --run-name "${RL_RUN}"
+fi
+
+fi  # RUN_RL
+
+# ===========================================================================
 # Summary
 # ===========================================================================
 echo ""
 echo "================================================================"
-echo "  function-calling SFT complete!"
+echo "  pipeline complete (RUN_RL=${RUN_RL})"
 echo "================================================================"
 echo ""
-echo "Checkpoint:"
-echo "  ${FUNCALL_RUN}: checkpoints/${FUNCALL_RUN}/latest.pt"
+echo "Checkpoints:"
+echo "  funcall SFT: checkpoints/${FUNCALL_RUN}/latest.pt"
+if [ "${RUN_RL}" = "1" ]; then
+    echo "  MBPP RL v2:  checkpoints/${RL_RUN}/latest.pt"
+fi
 echo ""
 echo "TensorBoard:"
 echo "  ${VENV_DIR}/bin/tensorboard --logdir runs/tb"
+echo "  (比较 codechat_8b_rl vs ${RL_RUN} 看 reward 曲线是否摆脱了恒 0)"
 echo ""
 echo "Quick smoke test:"
 echo "  ${PY} -m scripts.chat_cli --ckpt checkpoints/${FUNCALL_RUN}/latest.pt"
 echo ""
 echo "Re-run partial stages:"
-echo "  SKIP_TO=2 bash runs/train_a800_x8_v2_funcall.sh      # 只跑 SFT"
-echo "  FORCE_PREP=1 bash runs/train_a800_x8_v2_funcall.sh   # 重建 jsonl"
-echo "  MAX_EXAMPLES=2000 bash runs/train_a800_x8_v2_funcall.sh  # 小规模 smoke"
+echo "  SKIP_TO=2 bash runs/train_a800_x8_v2_funcall.sh               # 只跑 funcall SFT"
+echo "  FORCE_PREP=1 bash runs/train_a800_x8_v2_funcall.sh            # 重建 jsonl"
+echo "  MAX_EXAMPLES=2000 bash runs/train_a800_x8_v2_funcall.sh       # 小规模 smoke"
+echo "  RUN_RL=1 SKIP_TO=3 bash runs/train_a800_x8_v2_funcall.sh      # 仅跑 RL 3 阶段"
+echo "  RUN_RL=1 SKIP_TO=5 bash runs/train_a800_x8_v2_funcall.sh      # 跳过诊断/过滤 (已有 curriculum)"
