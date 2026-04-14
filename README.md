@@ -11,6 +11,12 @@
 # 首次运行会自动创建 .venv_train（复用系统 torch），再装 tensorboard 等缺的包
 bash runs/train_a800_x8.sh
 
+# Function-calling 能力续 SFT (从 8B_sft checkpoint 继续，glaiveai/glaive-function-calling-v2)
+bash runs/train_a800_x8_v2_funcall.sh
+
+# 同一条 pipeline 带上"救活 MBPP RL"3 阶段 (pass@k 诊断 → 难度过滤 → 优化版 GRPO)
+RUN_RL=1 bash runs/train_a800_x8_v2_funcall.sh
+
 # 或者只跑预训练 (venv 已建好后)
 ./.venv_train/bin/python -m torch.distributed.run \
     --standalone --nproc_per_node=8 \
@@ -151,10 +157,10 @@ bash runs/train_a800_x8.sh
 | Stage | 内容 | 说明 |
 |---|---|---|
 | 1 | 预训练数据准备 | 已有 `data/pretrain/*.bin` 可注释掉 |
-| 2 | **8B 预训练 (FSDP x8)** | 30k step，本文主角 |
+| 2 | **8B 预训练 (FSDP x8)** | 30k step ✅ DONE (~48.9h) |
 | 3 | SFT 数据准备 | |
-| 4 | 8B SFT (FSDP x8) | ⚠️ 需先给 `chat_sft.py` 加 FSDP 支持 |
-| 5 | RL (GRPO on MBPP) | 8B RL 单卡跑不动，同样需要 FSDP |
+| 4 | 8B SFT (FSDP x8) | `chat_sft.py` 已补 FSDP 支持 ✅ DONE (~4.8h) |
+| 5 | RL (GRPO on MBPP) | `chat_rl.py` 已补 FSDP；但 base 能力不足，reward 恒 0 ⚠️ 详见 "MBPP RL 救活指南" |
 
 ### 关键超参 (base_train)
 
@@ -236,19 +242,107 @@ FSDP 训练时每隔 `--save-every` 步触发一次 `save_ckpt`：
 - **OOM 在第 1 步**：通常是 **NCCL buffer + 激活 peak** 撞上。先把 `--device-batch-size` 固定 1，再把 `block_size` 调到 1024 临时验证，最后调回 2048。
 - **OOM 在 save 时**：rank 0 CPU 内存不够装 8B fp32。确认主机 RAM ≥ 64GB；否则把 `offload_to_cpu=False` 改成直接从 GPU 盘存（代价是 rank-0 GPU 要装一份完整 ~32GB，80GB 卡够）。
 - **速度远低于预期 (<5 Ktok/s)**：先看 `nvidia-smi topo -m` 是不是所有卡都走 NVLink；其次看 `grad_accum=8` 里 7 次 `no_sync` 是否生效（FSDP 下 `no_sync` 的收益比 DDP 小但仍有 ~10-20%）。
-- **chat_sft.py / chat_rl.py 当前不支持 FSDP**：`runs/train_a800_x8.sh` 的 stage 4 / 5 已经把 SFT/RL 也用 `torchrun` 包好了，但 `scripts/chat_sft.py` 和 `scripts/chat_rl.py` 尚未打相同补丁；跑到 stage 4 之前需要先按 `base_train.py` 的 pattern 给 SFT 脚本加 `setup_distributed + wrap_fsdp`（或者告诉我，我来加）。
+- ~~**chat_sft.py / chat_rl.py 当前不支持 FSDP**~~（已解决）：`scripts/chat_sft.py` 和 `scripts/chat_rl.py` 均已按 `base_train.py` 的 pattern 加好 `setup_distributed + wrap_fsdp`（commits `bc8c26b` / `8bcc723`）。`torchrun --nproc_per_node=8 -m scripts.chat_sft|chat_rl` 直接可用，单卡调用仍走老路径。
 
 ---
 
-## 对比：`train_a800.sh` / `train_a800_v2.sh` / `train_a800_x8.sh`
+## 对比：`train_a800*.sh` 家族
 
 | 脚本 | 目标硬件 | 模型 | 分布式 | 适合场景 |
 |---|---|---|---|---|
 | `train_a800.sh` | 1x A800 | 2B | 无 | 主 pipeline 的入门路线（主 README 描述） |
 | `train_a800_v2.sh` | 1x A800 | 2B | 无 | 在 v1 基础上追加 SWE-bench eval + docker RL |
 | **`train_a800_x8.sh`** | **8x A800** | **8B** | **FSDP FULL_SHARD** | **本文主角**：放大到 8B，拿满 8 卡吞吐 |
+| **`train_a800_x8_v2_funcall.sh`** | **8x A800** | **8B** | **FSDP** | funcall 续 SFT + "救活 MBPP RL" 的优化版 3 阶段（见下） |
 
-三个脚本互不替代，按手里机器选。
+四个脚本互不替代，按手里机器和目标选。
+
+---
+
+## Function-calling 能力训练 (`train_a800_x8_v2_funcall.sh`)
+
+从 `checkpoints/codechat_8b_sft/latest.pt` 基础上，用 [`glaiveai/glaive-function-calling-v2`](https://huggingface.co/datasets/glaiveai/glaive-function-calling-v2)（~113k 多轮对话）继续 SFT，让模型学会：
+
+- 看到 SYSTEM 里声明的函数 + USER 请求后，输出 `<functioncall> {"name": ..., "arguments": ...}` 的 JSON 调用
+- 收到 FUNCTION RESPONSE 后用自然语言总结给用户
+
+**聊天格式**（复用 GPT-2 BPE，不改 tokenizer，新 role tag 直接 BPE）：
+
+```
+<|system|>\n{function schema}\n<|end|>\n
+<|user|>\n{query}\n<|end|>\n
+<|assistant|>\n<functioncall> {...json...}\n<|end|>\n
+<|function_response|>\n{tool output}\n<|end|>\n
+<|assistant|>\n{final answer}\n<|end|>\n
+```
+
+loss 只计算 assistant 段的 token（system / user / function_response 全部 `-100` 掩掉），让模型专门学"该在什么时候发 functioncall"和"响应回来怎么措辞"。
+
+**最小运行**：
+
+```bash
+# 默认只跑 funcall SFT (stage 1-2)
+bash runs/train_a800_x8_v2_funcall.sh
+
+# 快速 smoke test (2000 条样本)
+MAX_EXAMPLES=2000 bash runs/train_a800_x8_v2_funcall.sh
+
+# 完整跑：funcall SFT + 优化版 MBPP RL (stage 1-5)
+RUN_RL=1 bash runs/train_a800_x8_v2_funcall.sh
+```
+
+**文件**：
+
+| 文件 | 作用 |
+|---|---|
+| `scripts/prepare_sft_funcall.py` | 解析 glaive 的 `SYSTEM:/USER:/A:/FUNCTION RESPONSE:` 标记，产出 `{input_ids, labels}` jsonl |
+| `runs/train_a800_x8_v2_funcall.sh` | 5-stage pipeline (SFT + 可选 RL) |
+
+---
+
+## MBPP RL 救活指南（`RUN_RL=1` 的 3 阶段）
+
+首轮 `train_a800_x8.sh` 的 stage 5 RL 跑了 415 步 ≈ 16.7h，**reward 恒等于 0.000**（详见 [`reports/TRAINING_REPORT_8b_a88_x8.md`](reports/TRAINING_REPORT_8b_a88_x8.md#5-阶段-5-rl--grpo--已跑通但无收益-reward0)）。根因：group_size=4 的 4 个 rollout 一次都没过 MBPP test → advantage 全 0 → GRPO 无梯度信号，训练无意义。
+
+`train_a800_x8_v2_funcall.sh` 里新增的 stage 3-5 是对应的优化方案，对齐训练报告 §5.6 的性价比清单：
+
+| Stage | 脚本 | 优化点 | 解决的问题 |
+|---|---|---|---|
+| 3 | `scripts/eval_mbpp_pass_at_k.py` | pass@k 诊断 + VERDICT | #6 先量化 base 能力，避免白烧 |
+| 4 | `scripts/filter_mbpp_by_passrate.py` | 只保留 pass_rate ∈ [0.05, 0.95] 的题 | #3 把"全 0"和"白给"的题过滤掉，每步都有 group 方差 |
+| 5 | `scripts/chat_rl.py` 新增 flag | `--reward-mode tiered` + `--group-size 8` + `--log-rollouts-every 50` | #1 阶梯奖励 + #4 更大 group + #5 肉眼看 rollout |
+
+### 阶梯奖励 (`codechat/execution.py:mode="tiered"`)
+
+| 条件 | reward |
+|---|---|
+| 代码为空 / ast.parse 失败 | 0.00 |
+| parse 过 / exec 报错 | 0.05 |
+| exec 过 / 0 test 通过 | 0.15 |
+| k/n test 通过 (0<k<n) | 0.15 + 0.85·k/n |
+| 全部 test 通过 | 1.00 |
+
+阶梯非常粗，只在"完全不会"和"基本能跑"之间打破 0/非0 断层，不会被琐碎的语法进展主导梯度。
+
+### pass@k VERDICT 规则
+
+`eval_mbpp_pass_at_k.py` 结束时会打印判据：
+
+- `pass@1 < 1%` → **"VERDICT: GRPO 会停滞，先强化 base"**，脚本仍会尝试 filter + RL，但 filter 很可能得到空集并 abort。
+- `pass@1 ∈ [1%, 5%)` → **"可以用 tiered + group≥8 + 过滤"**，期望值不高。
+- `pass@1 ≥ 5%` → **"标准 GRPO 应该能收敛"**，tiered 仍作为稳定器。
+
+### TB 对比
+
+新的 run 名是 `codechat_8b_rl_v2`，不会覆盖旧的 `codechat_8b_rl`。
+
+```bash
+./.venv_train/bin/tensorboard --logdir runs/tb
+# 打开后对比 rl/reward_mean 曲线：旧 run 应该全程贴 0，新 run 应该能离开 0
+# 另外新 run 会把 rl/rollout_best 作为 text 写进 TB，可在 TEXT 面板看模型实际输出
+```
+
+---
 
 ---
 
