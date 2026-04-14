@@ -15,7 +15,7 @@
 | 2 — 预训练 (8B, FSDP×8) | `scripts/base_train.py` | **DONE** | ~48.9h |
 | 3 — SFT 数据准备 | `scripts/prepare_sft.py` | **DONE** | — |
 | 4 — SFT (8B, FSDP×8) | `scripts/chat_sft.py` | **DONE** | ~4.8h |
-| 5 — RL / GRPO (MBPP) | `scripts/chat_rl.py` | **FIXED — 待重跑** | — |
+| 5 — RL / GRPO (MBPP) | `scripts/chat_rl.py` | **RUN — 无收益 (reward≡0)** | ~16.7h (至 step 415) |
 
 ---
 
@@ -162,81 +162,94 @@ checkpoints/codechat_8b_sft/latest.pt   (16 GB)
 
 ---
 
-## 5. 阶段 5: RL / GRPO — FAILED (CUDA OOM)
+## 5. 阶段 5: RL / GRPO — 已跑通但无收益 (reward≡0)
 
-### 5.1 RL 配置
+### 5.1 历史
+
+首次启动时 `chat_rl.py` 仍是单 GPU 设计，policy+ref+AdamW 合计 ~106GB 超过单卡
+80GB，首步 `optim.step()` 即 OOM。在 commit `8bcc723` 中给 `chat_rl.py` 加入
+FSDP 支持后（与 `chat_sft.py` 对齐：`setup_distributed()` + `wrap_fsdp()` +
+`dist.broadcast` 同步 sampling / mbpp 索引 + FSDP 感知的 grad clip），OOM 消失，
+8 卡 FSDP 下顺利进入训练循环。
+
+### 5.2 RL 配置（实际跑的一次）
 
 | 设置 | 值 |
 |------|-----|
 | SFT checkpoint | `checkpoints/codechat_8b_sft/latest.pt` |
-| 算法 | GRPO (Group Relative Policy Optimization) |
-| 数据集 | MBPP (sanitized), 120 条 |
-| 总步数 | 1,000 |
-| Group size | 4 (每个 prompt 采样 4 个补全) |
-| 学习率 | 1e-5 |
+| 算法 | GRPO (group size = 4, advantage = (r − r̄)/σ) |
+| 数据集 | MBPP (sanitized) train, ~374 条 |
+| 总步数 | 1,000（实际跑到 step 415 时中止，无意义） |
+| 学习率 | 1e-5 → cosine decay (warmup 20) |
 | KL 系数 | 0.02 |
 | 最大生成 tokens | 384 |
-| 温度 | 0.9 |
-| Top-k | 50 |
-| **运行模式** | **单 GPU** (非 FSDP) |
+| 温度 / top-k | 0.9 / 50 |
+| 运行模式 | **FSDP FULL_SHARD × 8** |
 
-### 5.2 崩溃详情
+### 5.3 训练日志（节选 step 240 – 415）
 
 ```
-File "scripts/chat_rl.py", line 176, in main
-    optim.step()
-  File ".../torch/optim/adam.py", line 182, in _init_group
-    state["exp_avg_sq"] = torch.zeros_like(...)
-torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.00 MiB.
-GPU 0 has a total capacity of 79.33 GiB of which 14.00 MiB is free.
-Process has 79.30 GiB memory in use.
+rl step   240 | reward 0.000 (max 0.00) | loss 0.0335 | lr 8.93e-06 | 30485s
+rl step   250 | reward 0.000 (max 0.00) | loss 0.0296 | lr 8.83e-06 | 32175s
+rl step   300 | reward 0.000 (max 0.00) | loss 0.0277 | lr 8.31e-06 | 40676s
+rl step   350 | reward 0.000 (max 0.00) | loss 0.0319 | lr 7.71e-06 | 49173s
+rl step   400 | reward 0.000 (max 0.00) | loss 0.0297 | lr 7.05e-06 | 57672s
+rl step   415 | reward 0.000 (max 0.00) | loss 0.0323 | lr 6.85e-06 | 60256s
 ```
 
-崩溃发生在第 1 步 `optim.step()` 时，Adam 优化器初始化第二动量 (`exp_avg_sq`) 失败。
+| 指标 | 观察值 |
+|------|--------|
+| reward_mean | **0.000 持续 415 步** |
+| reward_max | 0.00（4 个 rollout 一个都没对过） |
+| loss | 0.027 – 0.035 稳定区间 |
+| 每步耗时 | ~145 s（4 次 generate 384 tok + 4 次 forward + 1 次 step） |
+| 累计耗时 | ~16.7 h |
+| TB run | `runs/tb/codechat_8b_rl/` |
 
-### 5.3 OOM 根因分析
+### 5.4 为什么 reward 恒等于 0
 
-`chat_rl.py` 被设计为单 GPU 运行，但 8B 模型的显存需求远超单卡容量：
+GRPO 的有效梯度 = advantage × ∇logπ。当 group 内 4 个 rollout 的 reward 全是 0：
 
-| 组件 | 显存 (估算) |
-|------|------------|
-| Policy 模型 (8.3B, bf16) | ~16 GB |
-| Reference 模型 (8.3B, bf16, 冻结) | ~16 GB |
-| AdamW 状态 (exp_avg + exp_avg_sq, fp32) | ~64 GB |
-| 梯度 + 激活 + 中间计算 | ~10+ GB |
-| **总计** | **~106 GB** |
+- `r.mean() = 0, r.std() = 0` → advantage 全为 0 → **policy gradient 完全没信号**
+- `loss ≈ 0.03` 来自 **KL penalty 自身** (kl_coef × mean(logπ − logπ_ref))，而非学习
+- 等价于：模型只在被 KL 项轻微拉回/拉离 ref，做的是**纯随机游走**而不是朝向更高奖励
 
-单张 A800 仅有 79.33 GiB 可用，在加载 policy + ref 两个模型后 (~32GB) 加上前向/反向传播中间状态，已接近满载。当 Adam 优化器在第一步尝试分配 exp_avg 和 exp_avg_sq (每个 ~32GB fp32) 时，剩余显存完全不够。
+所以日志里 loss 在 0.03 抖，既不是"在学"，也不是"稳定收敛"——是**死信号**。
 
-### 5.4 修复方向
+根因是 MBPP 的执行奖励（`run_with_tests` 跑 unit test，全对得 1，否则 0）对
+当前 8B 来说门槛太高：
 
-要在 8B 模型上运行 RL，需要做以下改动之一或组合：
+1. **容量不足**：3.93B tokens 预训练 + 38k 通用 Alpaca SFT，远达不到能稳定写出
+   正确 Python 的水平。同量级公开模型能在 MBPP 上 pass@1 也要 5-10%，当前
+   模型显然没到。
+2. **奖励稀疏且二元**：binary pass/fail，没有部分得分 → group 内全 0 太容易发生。
+3. **4-rollout 的 group 太小**：即便问题的 pass 率是 2%，group=4 全 0 概率仍 ~92%。
+4. **`extract_code` 可能吃不到代码块**：模型输出若不带 fenced code block（或
+   模型跑出 END_TAG 前就把代码结构写歪），reward pipeline 会提前返回 0。
 
-1. **FSDP 支持** — 与 SFT 相同方式用 FSDP 包装 policy 和 ref 模型，将参数/优化器状态切分到 8 张卡上。这是最稳妥的方案。
-2. **DeepSpeed ZeRO-3** — 类似 FSDP 的零冗余方案。
-3. **卸载 ref 模型** — ref 模型仅在计算 KL 散度时需要前向传播，可以在不需要时卸载到 CPU。
-4. **梯度检查点 (activation checkpointing)** — 节省中间激活显存。
-5. **减小 group_size** — 从 4 降为 2，减少每步的显存峰值（但不解决根本问题）。
+### 5.5 结论：当前 RL run 无训练意义，建议终止
 
-**推荐方案**: 方案 1 (FSDP)，复用 `chat_sft.py` 已有的分布式代码。
+- **不要继续这次 RL**：再跑 600 步大概率仍是 reward=0，只会在 KL 项下
+  让 policy 相对 `codechat_8b_sft/latest.pt` **轻微漂移**，不会变强。
+- **不要把 `codechat_8b_rl/latest.pt` 当下一阶段的起点**（funcall 等），
+  直接用 `codechat_8b_sft/latest.pt`。RL ckpt 至多等价、很可能略差。
 
-### 5.5 已应用修复
+### 5.6 如果还想把 MBPP RL 救活——优化清单（按性价比排序）
 
-已为 `scripts/chat_rl.py` 增加 FSDP 支持，改动与 `chat_sft.py` 一致：
+| # | 改动 | 预期效果 | 改动位置 |
+|---|------|--------|---------|
+| 1 | **dense / shaped reward**：按通过测试数比例给分（3/5 测试过得 0.6），而非 0/1 | 立刻打破 group 全 0，group 内有方差 → advantage 非零 | `codechat/execution.py::run_with_tests` |
+| 2 | **加语法奖励**（能 `ast.parse` 的给 0.1，能 import 的 0.2，能跑但 test 失败的 0.3，全过 1.0）课程式递进 | 模型先学会"输出合法 Python"，再学"算对" | `run_with_tests` + `chat_rl.py` reward 组合 |
+| 3 | **按难度过滤 MBPP**：先用 SFT 模型在 MBPP train 上跑 N 次 rollout，保留 pass rate ∈ [0.1, 0.9] 的问题 | 确保每个 prompt 有非零信号也没"白给"，样本利用率最大化 | 新脚本 `scripts/filter_mbpp_by_passrate.py` |
+| 4 | **增大 group_size**：4 → 8 或 16 | pass 率 2% 时，group=8 至少一个对的概率从 8% 提到 15% | `--group-size 8`，显存代价较高 |
+| 5 | **log 一些 rollout 文本到 stdout/TB**：每 N 步抽一个 rollout 打印 | 能眼看模型在写什么（是胡言乱语还是接近），不用猜 | `chat_rl.py` 中加 `if step % 50 == 0 and is_master: print(decode(new_ids[:200]))` |
+| 6 | **先跑诊断，再决定开不开 RL**：在 MBPP train 50 条上对 SFT ckpt 直接 eval pass@4（温度 0.9），如果 pass@4 < 1-2%，根本不具备 RL 条件 | 避免再白烧 16 小时 | 新脚本 `scripts/eval_mbpp_pass_at_k.py` |
+| 7 | **加大 SFT 规模**：Alpaca 38k 偏通用，加入真·代码数据（CodeAlpaca + MBPP train 的标准解作为 SFT target），先 cold-start 一下 code ability | 拉高 base pass@k，RL 才有立足点 | `scripts/prepare_sft.py` 增加源 |
+| 8 | **改更简单的 RL 任务**：例如"补全函数签名"、"把 docstring 翻译成代码骨架"，门槛低很多 | 短期能拿到正 reward 曲线，不追求 MBPP 正解 | 新 reward 函数 |
+| 9 | **(大改) 换更强的 base**：更多预训练 tokens，或直接拿已有开源 1B-8B code 模型作 warm start | 从根本上让 RL 有可学的空间 | 涉及替换 tokenizer / 模型 |
 
-- 加入 `setup_distributed()` + `wrap_fsdp()` — 自动检测 torchrun 环境，FSDP FULL_SHARD 包装 policy 和 ref 模型
-- Checkpoint 改为 `map_location="cpu"` 加载，避免多进程争抢 GPU 0
-- 采样阶段 (`sample_one`) 加入 `dist.broadcast(nxt, src=0)` 保证所有 rank 采样同一 token
-- MBPP 问题索引通过 `dist.broadcast` 同步
-- 梯度裁剪改用 FSDP 的 `clip_grad_norm_()`
-- TensorBoard / print 仅 rank 0 执行
-- 训练结束加入 `dist.barrier()` + `dist.destroy_process_group()`
-- `runs/train_a800_x8.sh` 中 RL 阶段改为 `torchrun --nproc_per_node=8` 启动
-
-重跑命令：
-```bash
-SKIP_TO=5 bash runs/train_a800_x8.sh
-```
+最小可行组合：**#1 + #5 + #6**。先跑 #6 的 pass@k 诊断验证 base 能力，再用 #1
+改奖励从 binary 到 fractional，加 #5 打印看 rollout，就能判断 RL 是否还有救。
 
 ---
 
@@ -330,14 +343,44 @@ tensorboard --logdir runs/tb
 | `runs/tb/codechat_2b` | 2B 预训练 (基线) |
 | `runs/tb/codechat_8b` | 8B 预训练 |
 | `runs/tb/codechat_8b_sft` | 8B SFT (已完成) |
-| `runs/tb/codechat_8b_rl` | 8B RL (仅初始化，未产生有效数据) |
+| `runs/tb/codechat_8b_rl` | 8B RL — 415 步，reward 恒 0，详见 §5 |
 
 ---
 
-## 9. 总结
+## 9. 总结 & 下一步
 
-1. **预训练完成**: 8B 模型 30k 步训练，loss 从 11.37 收敛至 0.61，曲线平滑无发散。
-2. **SFT 完成**: 3,000 步微调，loss 降至 0.12，收敛良好。Checkpoint 已保存 (16GB)。
-3. **RL 阶段已修复**: `chat_rl.py` 原为单 GPU 设计导致 OOM (policy+ref+Adam ~106GB > 80GB)，已加入 FSDP 支持，待重跑。
-4. **规模效果显著**: 8B 比 2B 在预训练 loss 上有质的提升 (0.61 vs 0.87)。
-5. **下一步**: 运行 `SKIP_TO=5 bash runs/train_a800_x8.sh` 重跑 RL 阶段。
+### 现状
+
+1. **预训练完成** — 30k 步，loss 11.37 → 0.61。
+2. **SFT 完成** — 3k 步，loss 降到 0.12，`codechat_8b_sft/latest.pt` 可用。
+3. **RL 跑通但无收益** — FSDP fix 让 RL 不再 OOM，但 415 步 reward 恒 0，
+   advantage 全 0 → loss 只是 KL 自振荡，**不是在学**。这次 RL run **不建议继续**，
+   `codechat_8b_rl/latest.pt` 也**不建议作为下游起点**（详见 §5）。
+4. **规模优势明显** — 8B 比 2B 预训练 loss 低 ~30% (0.61 vs 0.87)。
+
+### 推荐下一步（按优先级）
+
+1. **终止 RL run**，不浪费 GPU 时。保留 `codechat_8b_sft/latest.pt` 作为所有
+   下游微调的起点。
+2. **(推荐首选)** 直接跑 **function-calling SFT**：从 glaive-function-calling-v2
+   接着 SFT。格式任务、有稠密监督、不依赖生成质量——是当前 8B 最容易看到正向
+   信号的方向：
+   ```bash
+   BASE_CKPT=checkpoints/codechat_8b_sft/latest.pt \
+       bash runs/train_a800_x8_v2_funcall.sh
+   ```
+3. **想救 MBPP RL**：不要直接重跑，先按 §5.6 里 **#6 → #1 → #5** 的顺序做：
+   1. 先跑 `eval_mbpp_pass_at_k` 诊断（半小时），看 SFT ckpt 在 MBPP 上 pass@4
+      到底是多少。如果 < 1%，RL 没戏，回到路线 2。
+   2. 如果 pass@4 ≥ 2-3%，把 reward 从 binary 改成 fractional（通过测试数 / 总测试数），
+      并 log rollout 文本，再重跑 200 步看 reward_mean 是否离开 0。
+4. **中期**：评估是否把 Alpaca SFT 扩成"代码 SFT"（加入 MBPP train 的标准解、
+   CodeContests、Python 教材对话），拉高 base 的代码能力，为后续 SWE-bench RL
+   （train_a800_v2.sh 里的三阶段课程）铺路。
+
+### 一句话判断
+
+> **reward=0.000 = 训练确实没意义（GRPO 无梯度信号）**，但
+> 这不代表 RL 本身不能做，只说明**当前 base 能力 × MBPP 难度 × 二元奖励**
+> 这个组合不成立。优先把 funcall SFT 跑出来拿到第一个对外能力点，之后再带着
+> 更强的 base 和更稠密的 reward 回来做 RL。
