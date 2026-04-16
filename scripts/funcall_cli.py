@@ -37,6 +37,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import torch
 import torch.nn.functional as F
@@ -116,18 +117,49 @@ def generate(model, prompt_ids, max_new_tokens, temperature, top_k, block_size):
 
 
 def parse_call(text: str) -> dict | None:
-    """Extract {name, arguments} from a `<functioncall>` emission, or None."""
+    """Extract {name, arguments} from a `<functioncall>` emission, or None.
+
+    Tolerates the model's common output quirks:
+      - `arguments` wrapped in single quotes (Python-repr JSON-in-JSON)
+      - `arguments` as an already-parsed dict
+      - `arguments` as a double-quoted JSON-encoded string
+    """
     blob = _extract_functioncall_json(text)
     if blob is None:
         return None
+
+    # Happy path: the whole thing parses as JSON
     parsed = _parse_json_loose(blob)
-    if not isinstance(parsed, dict):
+    if isinstance(parsed, dict):
+        name = parsed.get("name")
+        if isinstance(name, str):
+            args = _unwrap_args(parsed.get("arguments"))
+            return {"name": name.strip(),
+                    "arguments": args if args is not None else {}}
+
+    # Fallback: blob itself isn't parseable (typically because of the
+    # single-quoted `arguments` issue). Extract name + args-blob via regex
+    # and parse them separately.
+    name_m = re.search(r'"name"\s*:\s*"([^"]+)"', blob)
+    if not name_m:
         return None
-    name = parsed.get("name")
-    args = _unwrap_args(parsed.get("arguments"))
-    if not isinstance(name, str):
-        return None
-    return {"name": name.strip(), "arguments": args if args is not None else {}}
+    name = name_m.group(1).strip()
+
+    # arguments can appear as: `'{...}'` (single-quoted string), `"{...}"`
+    # (double-quoted, usually escaped), or a bare `{...}` object.
+    args: dict = {}
+    for pat in (
+        r'"arguments"\s*:\s*\'(\{.*?\})\'',   # single-quoted JSON-in-JSON
+        r'"arguments"\s*:\s*"(\{.*?\})"',     # double-quoted JSON-in-JSON
+        r'"arguments"\s*:\s*(\{.*?\})',       # inline object
+    ):
+        m = re.search(pat, blob, re.DOTALL)
+        if m:
+            inner = _parse_json_loose(m.group(1))
+            if isinstance(inner, dict):
+                args = inner
+            break
+    return {"name": name, "arguments": args}
 
 
 def load_model(ckpt_path: str):
@@ -138,6 +170,45 @@ def load_model(ckpt_path: str):
     del state
     model.eval()
     return model, cfg
+
+
+def chat(model, cfg, system_text, user_msg, executors,
+         max_new_tokens=256, temperature=0.7, top_k=50, max_rounds=4,
+         verbose=False):
+    """Full function-calling loop.
+
+    Args:
+      executors: {"tool_name": callable(**kwargs) -> json-serializable result}
+      max_rounds: cap to avoid infinite tool-call loops.
+
+    Returns (final_text, turns) — final_text is the model's natural-language
+    reply after tools have run; turns is the full conversation for debugging.
+    """
+    turns: list[tuple[str, str]] = [("user", user_msg)]
+    for _ in range(max_rounds):
+        raw = run_once(model, cfg, system_text, turns,
+                       max_new_tokens, temperature, top_k)
+        turns.append(("assistant", raw))
+        if verbose:
+            print(f"[assistant] {raw}")
+        call = parse_call(raw)
+        if call is None:
+            # Model gave a plain-text answer (no tool needed, or already answered)
+            return raw, turns
+        fn = executors.get(call["name"])
+        if fn is None:
+            msg = f'{{"error": "unknown tool: {call["name"]}"}}'
+        else:
+            try:
+                result = fn(**call["arguments"])
+                msg = json.dumps(result, ensure_ascii=False)
+            except Exception as e:
+                msg = json.dumps({"error": f"{type(e).__name__}: {e}"})
+        if verbose:
+            print(f"[function_response] {msg}")
+        turns.append(("function", msg))
+    # Hit round cap — surface whatever the last assistant turn was.
+    return turns[-1][1] if turns[-1][0] == "assistant" else "", turns
 
 
 def run_once(model, cfg, system_text, turns, max_new_tokens, temperature, top_k):
