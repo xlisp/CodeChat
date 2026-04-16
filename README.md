@@ -1,6 +1,17 @@
 # CodeChat 8B — 8x A800 训练说明
 
+* code
+
 ![](./demo.png)
+
+* function calling:
+```
+  python -m scripts.funcall_cli \
+      --ckpt checkpoints/codechat_8b_rl_funcall_v5/step_000060.pt \
+      --executors my_tools.py \
+      --user "Weather in Tokyo?"
+```
+![](./funcall_demo.png)
 
 本 README 专门介绍在 **8x NVIDIA A800-SXM4-80GB** 上把 CodeChat 从 **2B 升级到 8B** 的这次训练：动机、FSDP 分片方案、显存预算、启动命令、代码改动、续训策略、常见坑。与主 [`README_A800_x1.md`](README_A800_x1.md) 的单卡 2B 路线互补，不替代。
 
