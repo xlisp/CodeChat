@@ -159,15 +159,22 @@ def online_eval(model, eval_problems, cfg, device, max_new_tokens,
     then we all_reduce the counters to rank 0."""
     model.eval()
     n_eval = min(n_examples, len(eval_problems))
+    # Round down so every rank does exactly the same number of sample_batch
+    # calls. Otherwise FSDP all-gather collectives desync and NCCL times out.
+    n_eval = (n_eval // world_size) * world_size
+    if n_eval == 0:
+        return 0.0, 0.0, 0
     local_indices = range(rank, n_eval, world_size)
+    max_prompt_len = cfg.block_size - max_new_tokens
     local_pass1 = 0
     local_passk = 0
     local_total = 0
     for idx in local_indices:
         ex = eval_problems[idx]
         prompt_ids = torch.tensor([encode(ex["prompt"])], dtype=torch.long, device=device)
-        if prompt_ids.shape[1] > cfg.block_size - max_new_tokens:
-            continue
+        if prompt_ids.shape[1] > max_prompt_len:
+            # Left-truncate instead of `continue`. Skipping desyncs FSDP.
+            prompt_ids = prompt_ids[:, -max_prompt_len:]
         new_ids, _ = sample_batch(
             model, prompt_ids, num_samples, max_new_tokens,
             temperature, top_k, cfg.block_size,
@@ -326,9 +333,12 @@ def main():
         # ---- pick a problem (different per rank) ----
         ex = next_problem(step - 1)
         prompt_ids = torch.tensor([encode(ex["prompt"])], dtype=torch.long, device=device)
+        max_prompt_len = cfg.block_size - args.max_new_tokens
+        if prompt_ids.shape[1] > max_prompt_len:
+            # Left-truncate instead of `continue`: skipping on one rank would
+            # desync FSDP all-gather with the other ranks.
+            prompt_ids = prompt_ids[:, -max_prompt_len:]
         prompt_len = prompt_ids.shape[1]
-        if prompt_len > cfg.block_size - args.max_new_tokens:
-            continue
 
         # ---- rollouts (batched) ----
         new_ids_list, full_ids_all = sample_batch(
