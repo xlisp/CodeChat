@@ -226,6 +226,37 @@ def run_once(model, cfg, system_text, turns, max_new_tokens, temperature, top_k)
     return text.strip()
 
 
+BUILTIN_EXECUTORS = {
+    # Mock weather — for quick end-to-end demo without a real API.
+    "get_weather": lambda location, unit="celsius", **_: {
+        "location": location,
+        "temperature": 22 if unit == "celsius" else 72,
+        "unit": unit,
+        "conditions": "partly cloudy",
+        "_note": "mock response from BUILTIN_EXECUTORS; replace with a real API call",
+    },
+}
+
+
+def _load_executors(executors_path: str | None) -> dict:
+    """Load {tool_name: callable} from a Python file defining EXECUTORS dict.
+
+    Files loaded this way can call any library (requests, DB clients, etc.)
+    so tools perform real work. Without a path, we fall back to the
+    in-script BUILTIN_EXECUTORS (mocks).
+    """
+    if not executors_path:
+        return dict(BUILTIN_EXECUTORS)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("user_executors", executors_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    execs = getattr(mod, "EXECUTORS", None)
+    if not isinstance(execs, dict):
+        raise SystemExit(f"{executors_path}: must define EXECUTORS = {{...}}")
+    return execs
+
+
 def _load_tools(tools_file: str | None, tools_inline: str | None):
     if tools_file:
         with open(tools_file) as f:
@@ -267,6 +298,14 @@ def main():
     ap.add_argument("--tools",
                     help="inline tool schemas (JSON list or text blob)")
     ap.add_argument("--user", help="one-shot user message; omit for REPL")
+    ap.add_argument("--executors",
+                    help="Python file defining EXECUTORS={name: callable}; "
+                         "if omitted, uses in-script mocks for built-in tools")
+    ap.add_argument("--no-run", action="store_true",
+                    help="don't auto-execute tools; just print the parsed call "
+                         "(old one-shot behavior)")
+    ap.add_argument("--max-rounds", type=int, default=4,
+                    help="max tool-call rounds per user turn")
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top-k", type=int, default=50)
@@ -286,10 +325,26 @@ def main():
 
     tools = _load_tools(args.tools_file, args.tools)
     system_text = build_system(tools)
+    executors = _load_executors(args.executors)
 
-    def run_and_show(turns):
+    def run_auto(user_msg):
+        """Full loop: model call → tool execute → model reply."""
+        answer, turns = chat(
+            model, cfg, system_text, user_msg, executors,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            max_rounds=args.max_rounds,
+            verbose=True,
+        )
+        print("\n=== FINAL ANSWER ===")
+        print(answer)
+        return turns
+
+    def run_oneshot(user_msg):
+        """Old behavior: emit one call, don't execute."""
         raw = run_once(
-            model, cfg, system_text, turns,
+            model, cfg, system_text, [("user", user_msg)],
             args.max_new_tokens, args.temperature, args.top_k,
         )
         print("\n--- raw output ---")
@@ -298,37 +353,39 @@ def main():
             call = parse_call(raw)
             print("\n--- parsed call ---")
             if call is None:
-                print("  (no valid <functioncall> detected — model may be "
-                      "chatting instead of calling a tool)")
+                print("  (no valid <functioncall> detected)")
             else:
                 print(f"  name:      {call['name']}")
                 print(f"  arguments: {json.dumps(call['arguments'], ensure_ascii=False)}")
-        return raw
 
     # One-shot mode
     if args.user:
-        turns = [("user", args.user)]
-        run_and_show(turns)
+        if args.no_run:
+            run_oneshot(args.user)
+        else:
+            print(f"executors available: {sorted(executors.keys())}")
+            run_auto(args.user)
         return
 
     # REPL
     print("\n=== funcall REPL ===")
+    print(f"executors available: {sorted(executors.keys())}")
     print(f"tools in system message:\n{system_text}\n")
-    print("type a user message; after each model call you'll be prompted to")
-    print("paste a FUNCTION RESPONSE or just hit enter to start a new turn.")
+    if args.no_run:
+        print("--no-run: just printing parsed calls; paste function_response manually.")
+    else:
+        print("auto-run: tools will execute via registered executors.")
     print("Ctrl-C to exit.\n")
-    turns: list[tuple[str, str]] = []
     try:
         while True:
             user = input("user> ").strip()
             if not user:
                 continue
-            turns.append(("user", user))
-            raw = run_and_show(turns)
-            turns.append(("assistant", raw))
-            fr = input("\nfunction_response> (enter to skip) ").strip()
-            if fr:
-                turns.append(("function", fr))
+            if args.no_run:
+                run_oneshot(user)
+            else:
+                run_auto(user)
+            print()
     except (EOFError, KeyboardInterrupt):
         print()
 
