@@ -1,0 +1,76 @@
+(.venv_train) root@xxx:/mnt/openclaw/CodeChat#   python -m scripts.eval_funcall \
+      --ckpt checkpoints/codechat_8b_rl_funcall_v5/step_000060.pt \
+      --num-samples 16 --ks 1,4,8,16
+loaded 122 funcall eval problems from data/rl_funcall/eval.jsonl
+num_samples=16  ks=[1, 4, 8, 16]  temp=1.0  top_k=50  max_new_tokens=256
+evaluating 1 checkpoint(s)
+
+==> checkpoints/codechat_8b_rl_funcall_v5/step_000060.pt
+
+
+  --- example 1 ---
+  gt_name: calculate_average
+  gt_args: {}
+  rewards: [0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55]  (exact=0/16)
+  best tier=name_only  reward=0.55
+  best output:
+  <functioncall> {"name": "calculate_average", "arguments": '[5, 10, 15, 20, 25]'}
+  <
+
+  --- example 2 ---
+  gt_name: generate_random_name
+  gt_args: {}
+  rewards: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  (exact=16/16)
+  best tier=full_match  reward=1.00
+  best output:
+
+  best tier=full_match  reward=1.00
+  best output:
+  <functioncall> {"name": "generate_random_name", "arguments": {}}
+  <
+
+  --- example 3 ---
+  gt_name: get_current_time
+  gt_args: {}
+  rewards: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  (exact=16/16)
+  best tier=full_match  reward=1.00
+  best output:
+  <functioncall> {"name": "get_current_time", "arguments": {}}
+  <
+
+  --- example 4 ---
+  gt_name: get_random_joke
+  gt_args: {}
+  rewards: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  (exact=16/16)
+  best tier=full_match  reward=1.00
+  best output:
+  <functioncall> {"name": "get_random_joke", "arguments": {}}
+  <
+
+  --- example 5 ---
+  gt_name: get_random_fact
+  gt_args: {}
+  rewards: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  (exact=16/16)
+  best tier=full_match  reward=1.00
+  best output:
+  <functioncall> {"name": "get_random_fact", "arguments": {}}
+  <
+
+[step 60]  checkpoints/codechat_8b_rl_funcall_v5/step_000060.pt
+  Pass@1   =  86.37%
+  Pass@4   =  89.44%
+  Pass@8   =  91.20%
+  Pass@16  =  94.26%
+  full-match     = 1686/1952 (86.37%)
+  avg reward     = 0.886
+  tier distribution (of 1952 rollouts):
+    no_tag          39  ( 2.00%)
+    bad_json       201  (10.30%)
+    no_name          2  ( 0.10%)
+    wrong_name       3  ( 0.15%)
+    name_only       16  ( 0.82%)
+    partial          5  ( 0.26%)
+    full_match    1686  (86.37%)
+  elapsed: 1387s
+(.venv_train) root@xxx:/mnt/openclaw/CodeChat#
+
