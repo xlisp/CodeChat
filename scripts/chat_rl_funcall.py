@@ -111,6 +111,7 @@ def sample_batch(model, prompt_ids, num_samples, max_new_tokens,
     eot_ids = set(encode(END_TAG))
     done = torch.zeros(num_samples, dtype=torch.bool, device=ids.device)
     new_ids = [[] for _ in range(num_samples)]
+    is_dist = dist.is_available() and dist.is_initialized()
 
     for _ in range(max_new_tokens):
         cond = ids[:, -block_size:]
@@ -132,7 +133,15 @@ def sample_batch(model, prompt_ids, num_samples, max_new_tokens,
             new_ids[i].append(tok)
             if tok in eot_ids and len(new_ids[i]) > 4:
                 done[i] = True
-        if bool(done.all()):
+        # Early-stop must agree across FSDP ranks. Each rank has different
+        # rollouts that may finish at different steps; breaking locally would
+        # desync subsequent model.forward all-gathers. Reduce local done.all()
+        # with MIN so we only break when *every* rank has finished.
+        local_done = torch.tensor([1 if bool(done.all()) else 0],
+                                  device=ids.device, dtype=torch.int32)
+        if is_dist:
+            dist.all_reduce(local_done, op=dist.ReduceOp.MIN)
+        if bool(local_done.item()):
             break
     return new_ids, ids  # also return full tensor for later logprob forward
 
