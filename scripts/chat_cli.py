@@ -14,6 +14,7 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--user", help="one-shot prompt; omit for REPL")
     args = ap.parse_args()
 
     state = load_ckpt(args.ckpt)
@@ -22,8 +23,24 @@ def main():
     model.load_state_dict(state["model"])
     model.eval()
     print(f"loaded {args.ckpt}, depth={cfg.depth}, block_size={cfg.block_size}")
-    print("type your Python question; Ctrl-C to exit.\n")
 
+    def ask(history: str, user: str) -> str:
+        history += f"{USER_TAG}\n{user}\n{END_TAG}\n{ASSISTANT_TAG}\n"
+        ids = torch.tensor([encode(history)], dtype=torch.long, device=DEVICE)
+        out = model.generate(ids, max_new_tokens=args.max_new_tokens,
+                             temperature=args.temperature, top_k=args.top_k)
+        new_ids = out[0, ids.shape[1]:].tolist()
+        text = decode(new_ids)
+        if END_TAG in text:
+            text = text.split(END_TAG)[0]
+        return history + text.strip() + f"\n{END_TAG}\n", text.strip()
+
+    if args.user:
+        _, reply = ask("", args.user)
+        print(reply)
+        return
+
+    print("type your Python question; Ctrl-C to exit.\n")
     history = ""
     while True:
         try:
@@ -33,17 +50,8 @@ def main():
             break
         if not user:
             continue
-        history += f"{USER_TAG}\n{user}\n{END_TAG}\n{ASSISTANT_TAG}\n"
-        ids = torch.tensor([encode(history)], dtype=torch.long, device=DEVICE)
-        out = model.generate(ids, max_new_tokens=args.max_new_tokens,
-                             temperature=args.temperature, top_k=args.top_k)
-        new_ids = out[0, ids.shape[1]:].tolist()
-        text = decode(new_ids)
-        # stop at END_TAG if present
-        if END_TAG in text:
-            text = text.split(END_TAG)[0]
-        print(text.strip(), "\n")
-        history += text.strip() + f"\n{END_TAG}\n"
+        history, reply = ask(history, user)
+        print(reply, "\n")
 
 
 if __name__ == "__main__":

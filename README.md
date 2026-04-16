@@ -1,7 +1,13 @@
 # CodeChat 8B — 8x A800 训练说明
 
-* code
+* write code
 
+```
+python -m scripts.chat_cli \
+      --ckpt checkpoints/codechat_8b_sft_code/latest.pt \
+      --max-new-tokens 512 --temperature 0.7
+
+```
 ![](./demo.png)
 
 * function calling:
