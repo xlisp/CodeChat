@@ -5,3 +5,4 @@ data/
 runs/tb/
 checkpoints/
 .venv_train/
+runs/logs/
