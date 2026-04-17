@@ -1,9 +1,13 @@
 # CodeChat 8B v6 统一模型训练报告
 
 **日期**: 2026-04-16 ~ 2026-04-17
+
 **硬件**: 8× A800-SXM4-80GB (NVLink)
+
 **框架**: PyTorch 2.10 + FSDP (FULL_SHARD), bf16
+
 **相关脚本**: `runs/train_a800_x8_v6.sh`、`scripts/chat_sft.py`、`scripts/chat_rl_funcall.py`
+
 **承接**: v5 funcall RL 成功（`reports/TRAINING_REPORT_8b_funcall_v5.md`），但 v5 成了 funcall 专家 —— ~86% rollouts 输出 `<functioncall>`，丧失普通代码生成能力。v6 目标是 **一个 ckpt 同时处理 code 和 funcall**。
 
 ---
