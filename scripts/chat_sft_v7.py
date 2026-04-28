@@ -109,21 +109,27 @@ def wrap_fsdp(model):
 @torch.no_grad()
 def eval_loss(model, loader: SFTConvLoader, rank: int, world_size: int,
               is_dist: bool, device: torch.device) -> float:
-    """Mean supervised CE over the held-out shard. Each rank does a stride
-    of the shard (rank, rank+world_size, ...); all-reduce sums then divide.
-    Returns a float."""
+    """Mean supervised CE over the held-out shard. Every rank MUST call
+    model(...) the same number of times — FSDP FULL_SHARD all-gathers params
+    inside forward, so a one-rank-at-a-time loop deadlocks the NCCL watchdog
+    (was the v7 first-run crash). Round-robin: at iteration `it`, rank `r`
+    handles example `it*world_size + r`; ranks past the end run a dummy pass
+    whose loss is discarded so the collective stays balanced."""
     model.eval()
     total_loss = torch.zeros(1, device=device, dtype=torch.float32)
     total_count = torch.zeros(1, device=device, dtype=torch.float32)
-    for i, ex in enumerate(loader.examples):
-        if (i % world_size) != rank:
-            continue
+    n = len(loader.examples)
+    n_iter = (n + world_size - 1) // world_size
+    for it in range(n_iter):
+        idx = it * world_size + rank
+        is_real = idx < n
+        ex = loader.examples[idx if is_real else 0]
         ids, labels = loader._tokenize(ex["conversations"])
         x_row, y_row = loader._pack(ids, labels)
         x = torch.tensor([x_row], dtype=torch.long, device=device)
         y = torch.tensor([y_row], dtype=torch.long, device=device)
         _, loss = model(x, y)
-        if torch.isfinite(loss):
+        if is_real and torch.isfinite(loss):
             total_loss += loss.detach().float()
             total_count += 1.0
     if is_dist:
