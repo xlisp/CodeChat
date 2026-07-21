@@ -20,12 +20,53 @@ import matplotlib
 matplotlib.use("Agg")  # 无头环境
 import matplotlib.pyplot as plt
 
+# 让中文能正常显示（按可用性回退；找不到就退回 DejaVu，中文会变方框但不报错）
+matplotlib.rcParams["font.sans-serif"] = [
+    "Arial Unicode MS", "Hiragino Sans GB", "STHeiti", "Heiti TC",
+    "PingFang HK", "Songti SC", "DejaVu Sans",
+]
+matplotlib.rcParams["axes.unicode_minus"] = False
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 IMG = os.path.abspath(os.path.join(HERE, "..", "images"))
 os.makedirs(IMG, exist_ok=True)
 
 TOKENS = ["def", "add", "(", "a", ",", "b"]   # 一小段"代码"当例子
 T = len(TOKENS)
+
+
+# ---------------------------------------------------------------------------
+# 0) 给小白的"座位表"：谁能看谁（配文章《写在前面·场景三》）
+#    例子就用 "我爱吃苹果"，与正文 ASCII 表一一对应。
+# ---------------------------------------------------------------------------
+def demo_seatchart():
+    words = ["我", "爱", "吃", "苹果"]
+    n = len(words)
+    visible = torch.tril(torch.ones(n, n))  # 1=能看, 0=不能看
+
+    plt.figure(figsize=(4.6, 4.2))
+    # 绿=能看(1)，灰=不能看(0)
+    plt.imshow(visible, cmap="Greens", vmin=-0.3, vmax=1)
+    plt.xticks(range(n), words, fontsize=13)
+    plt.yticks(range(n), words, fontsize=13)
+    plt.xlabel("能不能看见这个字（列）", fontsize=11)
+    plt.ylabel("正在预测这个字（行）", fontsize=11)
+    plt.title("座位表：谁能看谁  绿=能看  灰=不能看", fontsize=12)
+    for i in range(n):
+        for j in range(n):
+            can = int(visible[i, j])
+            plt.text(j, i, "能看" if can else "遮住",
+                     ha="center", va="center", fontsize=11,
+                     color="white" if can else "dimgrey")
+    plt.tight_layout()
+    p = os.path.join(IMG, "seat_chart.png")
+    plt.savefig(p, dpi=130); plt.close()
+    print("\n[0] 座位表 (行=预测的字, 列=能不能看见):")
+    print("        " + "  ".join(f"{w:>3}" for w in words))
+    for i, w in enumerate(words):
+        row = "  ".join(("能看" if v else "遮住") for v in visible[i])
+        print(f"  {w:>4} {row}")
+    print(f"    -> saved {p}")
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +169,7 @@ def demo_dag():
 
 
 if __name__ == "__main__":
+    demo_seatchart()
     demo_mask()
     demo_attention()
     demo_dag()
