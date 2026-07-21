@@ -357,7 +357,109 @@ P(x1,…,xT) = ∏_t P(x_t | x_1,…,x_{t-1})
 
 ---
 
-## 8. 小结
+## 8. 掩码的本质:word2vec、dropout、完形填空是同一种思想吗?
+
+用户问得很到位:word2vec 的词袋模型(给一堆词猜中间填空)、dropout、以及"完形填空式"地训练"预测空缺"的能力——
+这些和因果掩码是不是一回事?
+
+**答案:在最高的哲学层面"是"——它们都属于"藏一部分、猜一部分"的自监督(self-supervision)家族;
+但往下一层,掩码在其中扮演了三种本质不同的角色,不能一锅烩。** 先给结论表:
+
+| 方法 | 藏什么 | 上下文方向 | mask 的角色 | 预测目标是被藏的东西吗? |
+|---|---|---|---|---|
+| **word2vec CBOW** | 中心词(1 个) | 双向(词袋,无序) | 定义任务:留出"空" | ✅ 是 |
+| **BERT MLM** | 随机 15% token | 双向 | 定义任务:`[MASK]` 造"空" | ✅ 是 |
+| **GPT / 本仓库** | 右边全部(未来) | 单向(只看左) | 约束信息流:防偷看 | ✅ 是(但"空"永远在最右端) |
+| **Dropout** | 随机隐藏单元 | —— | 正则化:逼出冗余 | ❌ 否,被藏的不是预测目标 |
+
+### 8.1 完形填空(cloze):这条思想的源头
+
+"完形填空"不是深度学习发明的。1953 年心理语言学家 **Wilson Taylor** 提出 *cloze procedure*:
+删掉文章里的词,让人根据上下文补全,以此测量文本可读性。核心假设是——
+**"能填对空,说明你真的理解了上下文。"** 后来整个自监督预训练,本质上都是把这个测人的方法反过来拿去训机器:
+**从无标注文本里,靠"挖空—补全"凭空造出监督信号。** 这就是"掩码本质"的那句话:
+
+> **掩码 = 一台从数据结构里凭空生产监督信号的机器。** 你不需要人工标注,只要把数据的一部分藏起来,
+> "该被藏的部分"自己就成了标签。藏法不同,就长出了 word2vec / BERT / GPT / dropout 这些不同的枝叶。
+
+### 8.2 word2vec CBOW:一次浅层的、双向的完形填空
+
+CBOW(Continuous Bag-of-Words)就是最朴素的神经完形填空:拿窗口内的上下文词,
+**把它们的词向量加起来求平均(这就是"词袋"——丢掉词序)**,去预测正中间被挖掉的那个词。
+
+```python
+# CBOW 的精神(示意):给定上下文,预测中心词
+context = ["the", "cat", "___", "on", "the", "mat"]   # 挖掉 "sat"
+h = mean([embedding[w] for w in context if w != "___"])  # 词袋:求和平均,无序
+logits = h @ W_out                                        # 预测填空
+loss = cross_entropy(logits, target="sat")
+```
+
+它和本仓库的关系比看上去更近:**word2vec 训练完,真正留下来被使用的只有那张 `embedding` 表。**
+而本仓库 `codechat/gpt.py:100` 的 `self.tok_emb = nn.Embedding(vocab_size, n_embd)` 正是这张表的直系后代——
+只不过 CBOW 用"双向词袋 + 浅层线性"来训它,GPT 用"单向因果掩码 + 40 层 Transformer"来训它。
+**词向量的血统是一样的,变的是产生监督信号的"挖空方式"和上面堆的算力。**
+
+区别也在这里:CBOW 是**双向**的(能同时看左右),而且**无序**(词袋);
+本仓库的因果掩码是**单向有序**的。所以严格说,GPT 不是"挖中间的空",而是"空永远在最右端"的退化完形填空——
+BERT 的 MLM(随机挖中间的 token、双向补全)才是 CBOW 在深层网络里的正统续作。
+
+### 8.3 Dropout:形似而神不同的"挖空"
+
+Dropout(Hinton 2012 / Srivastava 2014)训练时随机把一部分**隐藏单元**置 0。
+形式上它也是"随机挖空 + 用 mask 乘一下",所以直觉上很像完形填空。但它的**目的完全不同**:
+
+- **CBOW / BERT / GPT 的掩码定义了"要预测什么"**——被藏的 token 就是标签,mask 制造任务。
+- **Dropout 的掩码不制造任何预测目标**——被丢掉的单元不是要去预测的东西。它的目的是**正则化**:
+  逼着网络不要依赖任何单一特征,从而学到冗余、鲁棒的表示。Hinton 的解释是**隐式集成**——
+  每个 mini-batch 相当于训练一个不同的子网络,推理时再把它们"平均"起来。
+
+真正把两者接上的桥,是**去噪自编码器(Denoising Autoencoder,Vincent 2008)**:
+故意往输入里加噪声(比如随机置零一些输入),再让网络重建干净的原始输入。
+- 从这个视角看,**BERT 的 MLM 就是一个"噪声=遮盖 token"的去噪自编码器**——挖空是加噪,补全是去噪。
+- 而 **dropout 是加在隐藏层的噪声**,不要求重建、只要求"扛得住噪声还能干活"。
+
+所以三者的关系可以这样收束:
+
+```
+                  "藏一部分,逼网络处理"
+                          │
+        ┌─────────────────┼─────────────────┐
+   藏的是"标签"        藏的是"输入"         藏的是"隐藏单元"
+   → 完形填空          → 去噪自编码          → dropout
+   (CBOW/BERT/GPT)     (DAE, =MLM 的框架)   (正则化,无预测目标)
+   目的:学预测        目的:学重建          目的:学鲁棒
+```
+
+### 8.4 那本仓库到底站在哪一支?
+
+把上面的抽象落到 CodeChat 的代码上:
+
+- **它是 GPT 那一支**:纯单向因果 LM,`is_causal=True`(`gpt.py:67`)。"空"永远在序列最右端,
+  训练目标 `-∑ log P(x_t | x_<t)` 就是"永远在填最后一个空"。它**不做** BERT 式的中间挖空,
+  也**不是**词袋——因果掩码恰恰是为了**保住词序**(词袋丢序,因果掩码严格定序)。
+
+- **词向量是 word2vec 的后代**:`tok_emb`(`gpt.py:100`)与输出头权重共享(`gpt.py:106` 的 weight tying),
+  这张 embedding 表就是 word2vec 那张表在大模型时代的样子——只是训练它的完形填空从"双向浅层"换成了"单向深层"。
+
+- **dropout 在本仓库其实没启用**:`GPTConfig.dropout` 有这个字段(`gpt.py:24`,默认 `0.0`),
+  但**代码里没有任何一处真正读取/施加它**(注意力、MLP、embedding 全无 dropout;SDPA 的 `dropout_p` 也用默认 0)。
+  这是刻意的:这类大规模预训练靠**海量数据本身**做正则化,dropout 往往有害无益,现代 LLM(GPT-3 之后)大多关掉。
+  —— 顺带一提,这个 `dropout` 字段属于**未接线的遗留配置**,按仓库规范我不擅自删除,仅在此指出。
+
+### 8.5 一句话回答"是否是一致的思想"
+
+> **是,也不是。** 说"是"——CBOW、BERT、GPT、dropout、去噪自编码,骨子里都是**"藏起一部分,逼网络去补"**
+> 这一个自监督母题,cloze(完形填空)是它们共同的祖先。说"不是"——掩码在其中干三种不同的活:
+> **① 造预测目标**(CBOW 挖中心词、BERT 挖随机 token、GPT 把空钉在最右端);
+> **② 约束信息流**(因果掩码防止偷看未来,本仓库正是这一种);
+> **③ 做正则化**(dropout 挖隐藏单元,不为预测、只为鲁棒)。
+> **本仓库同时用了 ① 和 ②(空在右端 + 因果约束),继承了 word2vec 的词向量血统,却主动放弃了 ③(dropout=0)。**
+> 把这三种活分清楚,"完形填空训练预测能力"这条直觉就能准确落到每一种掩码上,而不至于把它们混成一团。
+
+---
+
+## 9. 小结
 
 | 概念 | 起源 | 数学形态 | 本仓库位置 |
 |---|---|---|---|
@@ -374,6 +476,12 @@ P(x1,…,xT) = ∏_t P(x_t | x_1,…,x_{t-1})
 ### 参考
 
 - Vaswani et al., *Attention Is All You Need*, NeurIPS 2017.
+- Taylor, *"Cloze Procedure": A New Tool for Measuring Readability*, 1953（完形填空的源头）。
+- Mikolov et al., *Efficient Estimation of Word Representations in Vector Space*, 2013（word2vec / CBOW / Skip-gram）。
+- Vincent et al., *Extracting and Composing Robust Features with Denoising Autoencoders*, ICML 2008（去噪自编码）。
+- Srivastava et al., *Dropout: A Simple Way to Prevent Neural Networks from Overfitting*, JMLR 2014。
+- Devlin et al., *BERT: Pre-training of Deep Bidirectional Transformers*, 2018（MLM = 深层双向完形填空）。
+- Pearl, *Causality: Models, Reasoning, and Inference*, 2009（因果推断 / do-算子 / 因果阶梯）。
 - PyTorch 文档：`torch.nn.functional.scaled_dot_product_attention`、`torch.tril` / `torch.triu`、`torch.nn.CrossEntropyLoss`。
 - HuggingFace `transformers`：`models/gpt2/modeling_gpt2.py`、`modeling_attn_mask_utils.py`（`AttentionMaskConverter` / `create_causal_mask`）。
 - 本仓库：`codechat/gpt.py`、`codechat/dataloader.py`、`CLAUDE.md`（loss-masking 约定）。
