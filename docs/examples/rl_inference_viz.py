@@ -111,7 +111,7 @@ def demo_dotprod_to_answer():
     fig, axes = plt.subplots(1, 4, figsize=(17, 3.9))
 
     im = axes[0].imshow(scores, cmap="coolwarm")
-    axes[0].set_title("① QKᵀ/√d：token 两两点积\n(gpt.py:67 SDPA 内部)", fontsize=10)
+    axes[0].set_title("① QK^T/√d：token 两两点积\n(gpt.py:67 SDPA 内部)", fontsize=10)
     axes[0].set_xticks(range(T)); axes[0].set_xticklabels(PROMPT, rotation=60, ha="right", fontsize=7)
     axes[0].set_yticks(range(T)); axes[0].set_yticklabels(PROMPT, fontsize=7)
     fig.colorbar(im, ax=axes[0], fraction=0.046)
@@ -126,7 +126,7 @@ def demo_dotprod_to_answer():
                  color=["tab:orange" if i < 6 else "tab:blue" for i in range(len(VOCAB))])
     axes[2].set_yticks(range(len(VOCAB))); axes[2].set_yticklabels(VOCAB, fontsize=8)
     axes[2].invert_yaxis()
-    axes[2].set_title("③ h·Eᵀ：隐状态和每个词点积\n(gpt.py:126，head 与 tok_emb 权重绑定)", fontsize=10)
+    axes[2].set_title("③ h·E^T：隐状态和每个词点积\n(gpt.py:126，head 与 tok_emb 权重绑定)", fontsize=10)
     axes[2].set_xlabel("logit")
 
     axes[3].barh(range(len(VOCAB)), probs.tolist(),
